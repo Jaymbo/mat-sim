@@ -1,0 +1,4 @@
+.env
+results.db
+*__pycache__*
+dashboard*
