@@ -22,6 +22,12 @@ Einzelnes Material analysieren (Dashboard + Vor-Evaluierung):
 Alle Materialien der DB analysieren:
     python -m mat_sim.run --analyze --all --db results.db
 
+Ranking — Top 20 nach optischem Score (mit Dashboards):
+    python -m mat_sim.run --analyze --rank --db results.db
+
+Ranking — Top 50, auch ohne Phasenwechsel:
+    python -m mat_sim.run --analyze --rank --top 50 --no-phase-change-filter --db results.db
+
 Queue-Statistik anzeigen:
     python -m mat_sim.run --queue-stats --db results.db
 
@@ -92,6 +98,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="MP-ID des zu analysierenden Materials (z. B. mp-1234)")
     p.add_argument("--all", action="store_true",
                    help="Alle Materialien der DB analysieren")
+    p.add_argument("--rank", action="store_true",
+                   help="Ranking-Modus: alle Materialien nach optischem Score sortieren")
+    p.add_argument("--top", type=int, default=20,
+                   help="Anzahl Top-Kandidaten für Dashboard-Export (Default: 20)")
+    p.add_argument("--no-phase-change-filter", action="store_true",
+                   help="Auch Materialien ohne T_switch ins Ranking aufnehmen")
     p.add_argument("--save", type=str, default=None,
                    help="Dateipfad für PNG-Export (Default: dashboard_<id>.png)")
     p.add_argument("--show", action="store_true",
@@ -132,7 +144,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ── Analyse-Modus ───────────────────────────────────────────────────────────
 
 def _run_analyze(args: argparse.Namespace) -> int:
-    from .analyze import analyze_material, analyze_all
+    from .analyze import analyze_material, analyze_all, rank_materials
+
+    if args.rank:
+        rank_materials(
+            db_path=args.db,
+            top=args.top,
+            only_phase_change=not args.no_phase_change_filter,
+            output_dir=args.save,
+        )
+        return 0
 
     if args.all:
         analyze_all(args.db, output_dir=Path(args.save) if args.save else None)

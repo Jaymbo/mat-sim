@@ -364,6 +364,109 @@ def optical_pre_evaluation(mat: StoredMaterial) -> str:
     return "\n".join(lines)
 
 
+# ── Ranking ─────────────────────────────────────────────────────────────────
+
+def rank_materials(
+    db_path: str | Path,
+    top: int = 20,
+    only_phase_change: bool = True,
+    output_dir: str | Path | None = None,
+) -> None:
+    """Alle Materialien nach optischem Score sortieren und Top-Kandidaten ausgeben.
+
+    Parameters
+    ----------
+    db_path
+        Pfad zur SQLite-Datenbank.
+    top
+        Anzahl der Top-Kandidaten, für die Dashboards erzeugt werden.
+    only_phase_change
+        Wenn *True*, werden nur Materialien mit detektiertem T_switch
+        berücksichtigt (Phasenwechsel ist Voraussetzung für Switchable Cooling).
+    output_dir
+        Verzeichnis für die Dashboard-PNGs der Top-Kandidaten.
+    """
+    from .optics import compute_optical_scores
+
+    ids = list_material_ids(db_path)
+    if not ids:
+        logger.warning("Keine Materialien in der Datenbank gefunden.")
+        return
+
+    # ── 1. Alle Materialien bewerten ───────────────────────────────────
+    rows: list[dict] = []
+    for mid in ids:
+        mat = load_result(db_path, mid)
+
+        # Filter: Phasenwechsel vorhanden?
+        if only_phase_change and mat.t_switch is None:
+            continue
+
+        # Status-Filter: nur konvergierte oder dezidierte Materialien
+        if mat.status == "diverged":
+            continue
+
+        # Optische Scores berechnen
+        try:
+            scores = compute_optical_scores(mat.formula)
+        except Exception:
+            continue
+
+        rows.append({
+            "material_id": mat.material_id,
+            "formula": mat.formula,
+            "status": mat.status,
+            "t_switch": mat.t_switch,
+            "t_decay": mat.t_decay,
+            "cooling_score": scores["cooling_score"],
+            "heating_score": scores["heating_score"],
+            "total_score": scores["total_score"],
+            "mat": mat,
+        })
+
+    if not rows:
+        print("Keine Materialien mit Phasenwechsel gefunden.")
+        return
+
+    # ── 2. Nach Total-Score sortieren ──────────────────────────────────
+    rows.sort(key=lambda r: r["total_score"], reverse=True)
+
+    # ── 3. Tabelle ausgeben ────────────────────────────────────────────
+    print("=" * 100)
+    print(f"  Ranking — Top {min(top, len(rows))} von {len(rows)} Materialien (sortiert nach Total-Score)")
+    if only_phase_change:
+        print("  Filter: nur Materialien mit detektiertem Phasenwechsel (T_switch)")
+    print("=" * 100)
+    print(f"  {'#':>3}  {'MP-ID':<14} {'Formel':<16} {'T_switch':>9} {'T_decay':>9} {'Cool%':>6} {'Heat%':>6} {'Total':>6}")
+    print("-" * 100)
+
+    for i, r in enumerate(rows[:top], start=1):
+        ts = f"{r['t_switch']:.0f} K" if r['t_switch'] is not None else "—"
+        td = f"{r['t_decay']:.0f} K" if r['t_decay'] is not None else "—"
+        print(
+            f"  {i:>3}  {r['material_id']:<14} {r['formula']:<16} "
+            f"{ts:>9} {td:>9} "
+            f"{r['cooling_score']:>6.1f} {r['heating_score']:>6.1f} {r['total_score']:>6.1f}"
+        )
+
+    print("=" * 100)
+
+    # ── 4. Dashboards für Top-Kandidaten erzeugen ──────────────────────
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+    else:
+        output_dir = Path("dashboards_top")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n  Erzeuge Dashboards für Top {top} → {output_dir}/")
+    for r in rows[:top]:
+        save_path = output_dir / f"dashboard_{r['material_id']}.png"
+        generate_dashboard(r["mat"], save_path=save_path, show=False)
+        print(f"    {r['material_id']} ({r['formula']}) → {save_path}")
+
+    print(f"\n  Fertig. {len(rows)} Materialien bewertet, Top {top} als Dashboard gespeichert.")
+
+
 # ── Komfort-API ─────────────────────────────────────────────────────────────
 
 def analyze_material(
