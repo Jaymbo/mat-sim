@@ -3,7 +3,7 @@ name = "mat-sim"
 version = "0.1.0"
 description = "High-Throughput Screening-Pipeline für Switchable Radiative Cooling"
 readme = "README.md"
-license = { file = "LICENSE""
+license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
     "pymatgen",
