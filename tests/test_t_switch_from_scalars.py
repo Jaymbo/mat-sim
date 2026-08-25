@@ -37,7 +37,7 @@ def test_volume_jump_detected() -> None:
 
 
 def test_q4_jump_detected() -> None:
-    """Q4-Sprung > 0.10 wird als T_switch erkannt."""
+    """Q4-Sprung > 0.05 wird als T_switch erkannt."""
     temps, vols, q4s = _smooth_ramp()
     # Q4-Sprung bei Schritt 20 (T=200 K): von ~0.77 auf ~0.50
     for i in range(20, 60):
@@ -80,10 +80,10 @@ def test_small_volume_change_no_switch() -> None:
 
 
 def test_small_q4_change_no_switch() -> None:
-    """Q4-Änderung < 0.10 wird nicht als Phasenwechsel gewertet."""
+    """Q4-Änderung < 0.05 wird nicht als Phasenwechsel gewertet."""
     temps, vols, q4s = _smooth_ramp()
     for i in range(20, 60):
-        q4s[i] -= 0.05  # unter Schwellwert
+        q4s[i] -= 0.03  # unter Schwellwert (Default 0.05)
 
     t_sw = detect_t_switch_from_scalars(vols, q4s, temps)
     assert t_sw is None
@@ -142,6 +142,19 @@ def test_custom_thresholds() -> None:
     t_sw = detect_t_switch_from_scalars(vols, q4s, temps, volume_threshold=0.01)
     assert t_sw is not None
     assert t_sw == 300.0
+
+
+def test_q4_threshold_boundary() -> None:
+    """Q4-Sprung genau an der 0.05-Schwelle wird erkannt."""
+    temps, vols, q4s = _smooth_ramp()
+    # Q4-Sprung bei Schritt 25 (T=250 K): 0.76 + 25*0.0005 = 0.7725 → 0.72
+    # ΔQ4 = 0.0525, knapp über Default-Schwelle 0.05
+    for i in range(25, 60):
+        q4s[i] = 0.72
+
+    t_sw = detect_t_switch_from_scalars(vols, q4s, temps)
+    assert t_sw is not None
+    assert t_sw == 250.0
 
 
 def test_first_step_jump() -> None:

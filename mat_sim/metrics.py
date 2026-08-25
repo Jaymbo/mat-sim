@@ -290,7 +290,7 @@ def detect_t_switch_from_scalars(
     ql_values: Sequence[float],
     temperatures: Sequence[float],
     volume_threshold: float = 0.03,
-    ql_threshold: float = 0.10,
+    ql_threshold: float = 0.05,
     min_persistence: int = 3,
 ) -> float | None:
     """T_switch aus Volumen- und Q4-Zeitreihen ableiten (ohne RDF-History).
@@ -302,7 +302,7 @@ def detect_t_switch_from_scalars(
        > ``volume_threshold`` (Default 3 %) zwischen aufeinanderfolgenden
        Temperaturschritten.
     2. **Q4-Sprung**: Diskontinuierliche Änderung des Steinhardt-Parameters
-       > ``ql_threshold`` (Default 0.10), die auf Symmetrie-Bruch hinweist.
+       > ``ql_threshold`` (Default 0.05), die auf Symmetrie-Bruch hinweist.
 
     Ein Phasenwechsel wird detektiert, wenn **mindestens eines** der beiden
     Signale einen Sprung zeigt.  Wenn beide Signale springen, erhöht sich
