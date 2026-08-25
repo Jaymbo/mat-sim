@@ -9,7 +9,7 @@
 #SBATCH --error=logs/%x_%j.err
 
 # ── Vorbereitung ────────────────────────────────────────────────────────────
-cd "$HOME/Dokumente/mat-sim"
+cd "$HOME/mat-sim"
 mkdir -p logs
 
 # CPU-Thread-Limits (verhindert Overhead auf Multi-Core-Knoten)
@@ -17,9 +17,9 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
-# ── Conda ───────────────────────────────────────────────────────────────────
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate mat-sim
+# ── uv aktivieren ───────────────────────────────────────────────────────────
+source "$HOME/.local/bin/env" 2>/dev/null || true
+export UV_CACHE_DIR="$HOME/.cache/uv"
 
 # ── Worker: claimt pending-Strukturen aus DB, simuliert, wiederholt ─────────
 echo "[$(date)] Starte mat-sim Worker auf $(hostname)"
@@ -29,13 +29,13 @@ echo "  GPU:           $CUDA_VISIBLE_DEVICES"
 echo ""
 
 # Stale-Einträge von abgestürzten Jobs zurücksetzen
-python -m mat_sim.run --reset-stale --db results.db
+uv run python -m mat_sim.run --reset-stale --db results.db
 
 # Queue-Statistik vor dem Start
-python -m mat_sim.run --queue-stats --db results.db
+uv run python -m mat_sim.run --queue-stats --db results.db
 
 # Verarbeitung: claimt pending-Strukturen aus der DB bis Time-Out oder leer
-python -m mat_sim.run \
+uv run python -m mat_sim.run \
     --db results.db \
     --device auto \
     --duration-min 25 \
@@ -48,7 +48,7 @@ echo ""
 echo "[$(date)] Worker beendet. Exit-Code: $TRAIN_EXIT"
 
 # Queue-Statistik nach Abschluss
-python -m mat_sim.run --queue-stats --db results.db
+uv run python -m mat_sim.run --queue-stats --db results.db
 
 # Exit-Code 88 = Time-Out (Dispatcher reicht ggf. neuen Job ein)
 # Exit-Code 0 = Queue leer

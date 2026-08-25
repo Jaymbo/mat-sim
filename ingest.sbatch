@@ -8,19 +8,19 @@
 #SBATCH --error=logs/%x_%j.err
 
 # ── Vorbereitung ────────────────────────────────────────────────────────────
-cd "$HOME/Dokumente/mat-sim"
+cd "$HOME/mat-sim"
 mkdir -p logs
 
-# ── Conda ───────────────────────────────────────────────────────────────────
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate mat-sim
+# ── uv aktivieren ───────────────────────────────────────────────────────────
+source "$HOME/.local/bin/env" 2>/dev/null || true
+export UV_CACHE_DIR="$HOME/.cache/uv"
 
 # ── Ingest-Phase: Strukturen von MP herunterladen → DB ──────────────────────
 echo "[$(date)] Starte mat-sim Ingest auf $(hostname)"
 echo ""
 
-# Chemische Systeme (binäre werden automatisch um ternäre erweitert)
-python -m mat_sim.run \
+# Python aus dem uv venv nutzen
+uv run python -m mat_sim.run \
     --ingest \
     --chemsys V-O Ti-O Cr-O Mn-O Sr-Ti-O \
     --include-ternary \
@@ -32,4 +32,4 @@ echo ""
 echo "[$(date)] Ingest beendet."
 
 # Queue-Statistik
-python -m mat_sim.run --queue-stats --db results.db
+uv run python -m mat_sim.run --queue-stats --db results.db

@@ -24,23 +24,28 @@ mat_sim/
 ## Quick Start
 
 ```bash
-# 1. Environment erstellen
-conda env create -f environment.yml
-conda activate mat-sim
+# 1. Repo klonen
+git clone git@github.com:Jaymbo/mat-sim.git
+cd mat-sim
 
 # 2. API-Key setzen
 cp .env.example .env
 # → MP_API_KEY in .env eintragen
 
-# 3. Strukturen herunterladen (Ingest)
-python -m mat_sim.run --ingest --chemsys V-O Ti-O Cr-O Mn-O Sr-Ti-O
+# 3. Environment mit uv erstellen
+uv sync
 
-# 4. Simulation starten (Process)
-python -m mat_sim.run --db results.db --device auto --duration-min 25
+# 4. Strukturen herunterladen (Ingest)
+uv run python -m mat_sim.run --ingest --chemsys V-O Ti-O Cr-O Mn-O Sr-Ti-O
 
-# 5. Ergebnisse analysieren
-python -m mat_sim.run --analyze --all --db results.db
+# 5. Simulation starten (Process)
+uv run python -m mat_sim.run --db results.db --device auto --duration-min 25
+
+# 6. Ergebnisse analysieren
+uv run python -m mat_sim.run --analyze --all --db results.db
 ```
+
+Alternativ mit Conda: `conda env create -f environment.yml && conda activate mat-sim`.
 
 ## Workflow
 
@@ -66,14 +71,20 @@ Job ein).
 ### SLURM-Cluster-Betrieb
 
 ```bash
-# 1. Einmalig: Ingest (CPU-Job)
+# 1. Auf dem Login-Knoten: uv installieren (falls nicht vorhanden)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Environment erstellen
+uv sync
+
+# 3. Einmalig: Ingest (CPU-Job)
 sbatch ingest.sbatch
 
-# 2. Dispatcher starten (lokal, tmux oder nohup)
+# 4. Dispatcher starten (lokal, tmux oder nohup)
 ./dispatcher.sh --max-jobs 10
 
-# 3. Status überwachen
-python -m mat_sim.run --queue-stats --db results.db
+# 5. Status überwachen
+uv run python -m mat_sim.run --queue-stats --db results.db
 ```
 
 Der Dispatcher überwacht die Queue und reicht automatisch neue Worker-Jobs
@@ -89,29 +100,29 @@ ein, bis alle Strukturen verarbeitet sind oder `MAX_JOBS` erreicht ist.
 
 ### Ingest
 ```bash
-python -m mat_sim.run --ingest --chemsys V-O Ti-O [--include-ternary] [--e-hull-max 0.1]
+uv run python -m mat_sim.run --ingest --chemsys V-O Ti-O [--include-ternary] [--e-hull-max 0.1]
 ```
 
 ### Process
 ```bash
-python -m mat_sim.run --db results.db [--device auto] [--duration-min 25] [--t-max 500] [--delta-t 10]
+uv run python -m mat_sim.run --db results.db [--device auto] [--duration-min 25] [--t-max 500] [--delta-t 10]
 ```
 
 ### Analyse
 ```bash
-python -m mat_sim.run --analyze --material-id mp-1234 --db results.db
-python -m mat_sim.run --analyze --all --db results.db
+uv run python -m mat_sim.run --analyze --material-id mp-1234 --db results.db
+uv run python -m mat_sim.run --analyze --all --db results.db
 ```
 
 ### Queue-Management
 ```bash
-python -m mat_sim.run --queue-stats --db results.db
-python -m mat_sim.run --reset-stale --db results.db [--stale-minutes 30]
+uv run python -m mat_sim.run --queue-stats --db results.db
+uv run python -m mat_sim.run --reset-stale --db results.db [--stale-minutes 30]
 ```
 
 ### Alle Optionen
 ```bash
-python -m mat_sim.run --help
+uv run python -m mat_sim.run --help
 ```
 
 ## Methodik
@@ -164,7 +175,7 @@ python -m mat_sim.run --help
 - PyMieScatt (Mie-Streuung)
 - python-dotenv (API-Key aus `.env`)
 
-Siehe `environment.yml` (Conda) oder `requirements.txt` (pip).
+Siehe `pyproject.toml` (uv/pip) oder `environment.yml` (Conda).
 
 ## Lizenz
 

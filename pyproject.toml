@@ -1,0 +1,22 @@
+[project]
+name = "mat-sim"
+version = "0.1.0"
+description = "High-Throughput Screening-Pipeline für Switchable Radiative Cooling"
+readme = "README.md"
+license = { file = "LICENSE""
+requires-python = ">=3.11"
+dependencies = [
+    "pymatgen",
+    "mp-api",
+    "ase",
+    "mace-torch",
+    "chgnet",
+    "scipy>=1.12",
+    "numpy",
+    "matplotlib",
+    "python-dotenv",
+    "PyMieScatt",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]

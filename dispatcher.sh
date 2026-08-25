@@ -39,18 +39,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-cd "$HOME/Dokumente/mat-sim"
+cd "$HOME/mat-sim"
 mkdir -p logs
 
-# ── Conda aktivieren (für python -m mat_sim.run) ────────────────────────────
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate mat-sim
+# ── uv aktivieren (für python -m mat_sim.run) ──────────────────────────────
+source "$HOME/.local/bin/env" 2>/dev/null || true
+export UV_CACHE_DIR="$HOME/.cache/uv"
 
 # ── Hilfsfunktionen ─────────────────────────────────────────────────────────
 
 # pending + processing aus der Queue auslesen
 get_pending() {
-    python -c "
+    uv run python -c "
 from mat_sim.storage import queue_stats
 s = queue_stats('$DB')
 print(s['pending'] + s['processing'])
@@ -64,12 +64,12 @@ get_running_jobs() {
 
 # Stale-Einträge zurücksetzen
 do_reset_stale() {
-    python -m mat_sim.run --reset-stale --stale-minutes "$STALE_MINUTES" --db "$DB" 2>/dev/null || true
+    uv run python -m mat_sim.run --reset-stale --stale-minutes "$STALE_MINUTES" --db "$DB" 2>/dev/null || true
 }
 
 # Queue-Statistik ausgeben
 print_stats() {
-    python -m mat_sim.run --queue-stats --db "$DB" 2>/dev/null || true
+    uv run python -m mat_sim.run --queue-stats --db "$DB" 2>/dev/null || true
 }
 
 # ── Haupt Schleife ──────────────────────────────────────────────────────────
