@@ -337,6 +337,8 @@ class ThermalRamp:
             rdf_r=r,
             rdf_g=g,
             ql=ql,
+            positions=atoms.get_positions().copy(),
+            cell=atoms.get_cell().copy(),
         )
 
     # ── Snapshot-Extraktion für spektrale Analyse ──────────────────────────
@@ -344,14 +346,16 @@ class ThermalRamp:
         self,
         result: TrajectoryResult,
         window: int = 1,
-    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-        """RDF-Snapshots kurz vor und nach T_switch extrahieren.
+    ) -> dict[str, tuple]:
+        """RDF- **und** Struktur-Snapshots kurz vor und nach T_switch extrahieren.
 
         Returns
         -------
         dict
-            ``{"before": (r, g), "after": (r, g)}`` oder leeres Dict,
-            falls kein T_switch gefunden wurde.
+            ``{"before": ((r, g), atoms), "after": ((r, g), atoms)}``
+            oder leeres Dict, falls kein T_switch gefunden wurde.
+            ``atoms`` ist ein ``ase.Atoms``-Objekt, das aus den gespeicherten
+            Positionen/Zellen rekonstruiert wurde.
         """
         if result.t_switch is None:
             return {}
@@ -360,7 +364,19 @@ class ThermalRamp:
         idx = int(np.argmin(np.abs(temps - result.t_switch)))
         lo = max(idx - window, 0)
         hi = min(idx + window, len(result.rdf_history) - 1)
+
+        symbols = self.atoms.get_chemical_symbols()
+        pbc = self.atoms.get_pbc()
+
+        def _make_atoms(i: int) -> Atoms:
+            return Atoms(
+                symbols=symbols,
+                positions=result.positions_history[i],
+                cell=result.cell_history[i],
+                pbc=pbc,
+            )
+
         return {
-            "before": result.rdf_history[lo],
-            "after": result.rdf_history[hi],
+            "before": (result.rdf_history[lo], _make_atoms(lo)),
+            "after": (result.rdf_history[hi], _make_atoms(hi)),
         }

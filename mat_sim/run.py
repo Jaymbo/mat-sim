@@ -104,6 +104,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Anzahl Top-Kandidaten für Dashboard-Export (Default: 20)")
     p.add_argument("--no-phase-change-filter", action="store_true",
                    help="Auch Materialien ohne T_switch ins Ranking aufnehmen")
+    p.add_argument("--recompute", action="store_true",
+                   help="Optische Scores neu berechnen (auch bereits gespeicherte)")
     p.add_argument("--save", type=str, default=None,
                    help="Dateipfad für PNG-Export (Default: dashboard_<id>.png)")
     p.add_argument("--show", action="store_true",
@@ -152,6 +154,7 @@ def _run_analyze(args: argparse.Namespace) -> int:
             top=args.top,
             only_phase_change=not args.no_phase_change_filter,
             output_dir=args.save,
+            recompute=args.recompute,
         )
         return 0
 

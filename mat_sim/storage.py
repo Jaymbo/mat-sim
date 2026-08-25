@@ -23,6 +23,7 @@ Workflow
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -33,6 +34,8 @@ import numpy as np
 
 from .acquisition import MPEntry
 from .metrics import TrajectoryResult
+
+logger = logging.getLogger(__name__)
 
 
 def init_db(db_path: str | Path) -> sqlite3.Connection:
@@ -72,11 +75,37 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
             ql_values       TEXT,
             volumes         TEXT,
             energies        TEXT,
+            structure_before_json TEXT,
+            structure_after_json  TEXT,
+            cooling_score   REAL,
+            heating_score   REAL,
+            total_score     REAL,
+            optical_evaluated TIMESTAMP,
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Schema-Migration: Spalten nachträglich hinzufügen, falls DB schon existiert
+    _migrate_columns(conn, "materials", {
+        "structure_before_json": "TEXT",
+        "structure_after_json": "TEXT",
+        "cooling_score": "REAL",
+        "heating_score": "REAL",
+        "total_score": "REAL",
+        "optical_evaluated": "TIMESTAMP",
+    })
+
     conn.commit()
     return conn
+
+
+def _migrate_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    """Spalten nachträglich hinzufügen, falls sie noch nicht existieren (Schema-Migration)."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for col_name, col_type in columns.items():
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+            logger.info("Schema-Migration: %s.%s (%s) hinzugefügt", table, col_name, col_type)
 
 
 def _rdf_to_json(rdf: tuple[np.ndarray, np.ndarray]) -> str:
@@ -84,24 +113,91 @@ def _rdf_to_json(rdf: tuple[np.ndarray, np.ndarray]) -> str:
     return json.dumps({"r": r.tolist(), "g": g.tolist()})
 
 
+def _atoms_to_json(atoms) -> str:
+    """ASE-Atoms-Objekt als JSON serialisieren (Positionen, Zelle, Symbole)."""
+    return json.dumps({
+        "symbols": list(atoms.get_chemical_symbols()),
+        "positions": atoms.get_positions().tolist(),
+        "cell": atoms.get_cell().tolist(),
+        "pbc": list(atoms.get_pbc()),
+        "volume": atoms.get_volume(),
+    })
+
+
+def _atoms_from_json(raw: str | None):
+    """JSON → ASE-Atoms-Objekt deserialisieren."""
+    from ase import Atoms
+
+    if raw is None:
+        return None
+    obj = json.loads(raw)
+    return Atoms(
+        symbols=obj["symbols"],
+        positions=obj["positions"],
+        cell=obj["cell"],
+        pbc=obj["pbc"],
+    )
+
+
 def store_result(
     conn: sqlite3.Connection,
     entry: MPEntry,
     result: TrajectoryResult,
-    snapshots: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    snapshots: dict | None = None,
 ) -> None:
-    """Ein einzelnes Ergebnis in die DB schreiben (Insert-or-Replace)."""
+    """Ein einzelnes Ergebnis in die DB schreiben (Insert-or-Replace).
+
+    Parameters
+    ----------
+    snapshots
+        ``{"before": ((r, g), atoms), "after": ((r, g), atoms)}`` oder
+        ``{"before": (r, g), "after": (r, g)}`` (altes Format, nur RDF).
+    """
     snapshots = snapshots or {}
-    rdf_before = _rdf_to_json(snapshots["before"]) if "before" in snapshots else None
-    rdf_after = _rdf_to_json(snapshots["after"]) if "after" in snapshots else None
+
+    rdf_before = None
+    rdf_after = None
+    atoms_before = None
+    atoms_after = None
+
+    for key in ("before", "after"):
+        val = snapshots.get(key)
+        if val is None:
+            continue
+
+        # Format: ((r, g), atoms) — RDF + Struktur
+        if (
+            isinstance(val, tuple)
+            and len(val) == 2
+            and isinstance(val[0], tuple)
+            and len(val[0]) == 2
+            and hasattr(val[1], "get_positions")
+        ):
+            rdf_tuple = (np.asarray(val[0][0]), np.asarray(val[0][1]))
+            atoms_json = _atoms_to_json(val[1])
+        # Format: (r, g) — nur RDF (altes Format)
+        elif isinstance(val, tuple) and len(val) == 2:
+            rdf_tuple = (np.asarray(val[0]), np.asarray(val[1]))
+            atoms_json = None
+        else:
+            continue
+
+        rdf_json = _rdf_to_json(rdf_tuple)
+        if key == "before":
+            rdf_before = rdf_json
+            atoms_before = atoms_json
+        else:
+            rdf_after = rdf_json
+            atoms_after = atoms_json
 
     conn.execute(
         """
         INSERT OR REPLACE INTO materials
             (material_id, formula, status, t_switch, t_decay,
              rdf_before_json, rdf_after_json,
-             temperatures, msd_values, ql_values, volumes, energies)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             temperatures, msd_values, ql_values, volumes, energies,
+             structure_before_json, structure_after_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             entry.material_id,
@@ -116,9 +212,72 @@ def store_result(
             json.dumps(result.ql_values),
             json.dumps(result.volumes),
             json.dumps(result.energies),
+            atoms_before,
+            atoms_after,
         ),
     )
     conn.commit()
+
+
+def store_optical_scores(
+    db_path: str | Path,
+    material_id: str,
+    cooling_score: float,
+    heating_score: float,
+    total_score: float,
+) -> None:
+    """Optische Scores für ein Material in der DB persistieren."""
+    conn = init_db(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE materials
+            SET cooling_score = ?, heating_score = ?, total_score = ?,
+                optical_evaluated = CURRENT_TIMESTAMP
+            WHERE material_id = ?
+            """,
+            (cooling_score, heating_score, total_score, material_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_switching_materials(db_path: str | Path) -> list[str]:
+    """Material-IDs aller Materialien mit detektiertem T_switch zurückgeben."""
+    conn = init_db(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT material_id FROM materials "
+            "WHERE t_switch IS NOT NULL AND status != 'diverged' "
+            "ORDER BY material_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows]
+
+
+def list_unevaluated_materials(db_path: str | Path, only_switching: bool = True) -> list[str]:
+    """Material-IDs ohne gespeicherte optische Scores zurückgeben.
+
+    Parameters
+    ----------
+    only_switching
+        Wenn *True*, nur Materialien mit T_switch berücksichtigen.
+    """
+    conn = init_db(db_path)
+    try:
+        query = (
+            "SELECT material_id FROM materials "
+            "WHERE total_score IS NULL AND status != 'diverged'"
+        )
+        if only_switching:
+            query += " AND t_switch IS NOT NULL"
+        query += " ORDER BY material_id"
+        rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows]
 
 
 def store_batch(
@@ -151,6 +310,13 @@ class StoredMaterial:
     ql_values: list[float]
     volumes: list[float]
     energies: list[float]
+    # Neue Felder (können None sein bei alten DB-Einträgen)
+    structure_before: object | None = None  # ase.Atoms oder None
+    structure_after: object | None = None
+    cooling_score: float | None = None
+    heating_score: float | None = None
+    total_score: float | None = None
+    optical_evaluated: str | None = None
 
 
 def _rdf_from_json(raw: str | None) -> tuple[np.ndarray, np.ndarray] | None:
@@ -173,7 +339,9 @@ def load_result(db_path: str | Path, material_id: str) -> StoredMaterial:
         row = conn.execute(
             "SELECT material_id, formula, status, t_switch, t_decay, "
             "rdf_before_json, rdf_after_json, "
-            "temperatures, msd_values, ql_values, volumes, energies "
+            "temperatures, msd_values, ql_values, volumes, energies, "
+            "structure_before_json, structure_after_json, "
+            "cooling_score, heating_score, total_score, optical_evaluated "
             "FROM materials WHERE material_id = ?",
             (material_id,),
         ).fetchone()
@@ -195,7 +363,13 @@ def load_result(db_path: str | Path, material_id: str) -> StoredMaterial:
         msd_values=json.loads(row[8]),
         ql_values=json.loads(row[9]),
         volumes=json.loads(row[10]),
-        energies=json.loads(row[11]),
+        energies=json.loads(row[11]) if row[11] else [],
+        structure_before=_atoms_from_json(row[12]),
+        structure_after=_atoms_from_json(row[13]),
+        cooling_score=row[14],
+        heating_score=row[15],
+        total_score=row[16],
+        optical_evaluated=row[17],
     )
 
 

@@ -25,7 +25,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .storage import StoredMaterial, load_result, list_material_ids
+from .storage import StoredMaterial, load_result, list_material_ids, list_switching_materials, store_optical_scores
 
 logger = logging.getLogger(__name__)
 
@@ -153,15 +153,15 @@ def _temp_label(mat: StoredMaterial, which: str) -> str:
 
 # ── Optisches Spektrum-Plot ─────────────────────────────────────────────────
 
-def _plot_optical_spectrum(ax, formula: str, quantity: str = "sca") -> None:
+def _plot_optical_spectrum(ax, mat: StoredMaterial, quantity: str = "sca") -> None:
     """Optisches Mie-Spektrum: kalt vs. heiss mit atmosphärischem Fenster.
 
     Parameters
     ----------
     ax
         Matplotlib-Achse.
-    formula
-        Chemische Formel des Materials.
+    mat
+        StoredMaterial mit Simulationsdaten (für strukturbasierte Optik).
     quantity
         ``"sca"`` für Q_sca (Streuung/Reflexion) oder
         ``"abs"`` für Q_abs (Absorption/Emissivität).
@@ -169,7 +169,7 @@ def _plot_optical_spectrum(ax, formula: str, quantity: str = "sca") -> None:
     from .optics import optical_summary
 
     try:
-        result = optical_summary(formula)
+        result = optical_summary(mat.formula, mat=mat)
     except Exception as exc:  # noqa: BLE001
         ax.text(0.5, 0.5, f"Optik-Berechnung fehlgeschlagen:\n{exc}",
                 transform=ax.transAxes, ha="center", va="center",
@@ -258,10 +258,10 @@ def generate_dashboard(
 
     _plot_temperature_ramp(axes[0, 0], mat)
     _plot_msd(axes[0, 1], mat)
-    _plot_optical_spectrum(axes[0, 2], mat.formula, quantity="sca")
+    _plot_optical_spectrum(axes[0, 2], mat, quantity="sca")
     _plot_volume_and_q4(axes[1, 0], mat)
     _plot_rdf_comparison(axes[1, 1], mat)
-    _plot_optical_spectrum(axes[1, 2], mat.formula, quantity="abs")
+    _plot_optical_spectrum(axes[1, 2], mat, quantity="abs")
 
     fig.tight_layout(rect=(0, 0, 1, 0.94))
 
@@ -371,8 +371,18 @@ def rank_materials(
     top: int = 20,
     only_phase_change: bool = True,
     output_dir: str | Path | None = None,
+    recompute: bool = False,
 ) -> None:
-    """Alle Materialien nach optischem Score sortieren und Top-Kandidaten ausgeben.
+    """Alle switching-Materialien nach optischem Score sortieren und ausgeben.
+
+    Workflow
+    --------
+    1. Materialien mit T_switch aus DB laden (nur switching-Materialien).
+    2. Optische Scores berechnen — strukturbasiert aus Simulationsdaten.
+       Bereits berechnete Scores werden aus der DB gelesen, außer
+       ``recompute=True``.
+    3. Nach Total-Score sortieren, Tabelle ausgeben.
+    4. Dashboards für Top-Kandidaten erzeugen.
 
     Parameters
     ----------
@@ -382,43 +392,62 @@ def rank_materials(
         Anzahl der Top-Kandidaten, für die Dashboards erzeugt werden.
     only_phase_change
         Wenn *True*, werden nur Materialien mit detektiertem T_switch
-        berücksichtigt (Phasenwechsel ist Voraussetzung für Switchable Cooling).
+        berücksichtigt.  Wenn *False*, alle Materialien.
     output_dir
         Verzeichnis für die Dashboard-PNGs der Top-Kandidaten.
+    recompute
+        Wenn *True*, werden alle optischen Scores neu berechnet (auch
+        bereits gespeicherte).
     """
     from .optics import compute_optical_scores
 
-    ids = list_material_ids(db_path)
-    if not ids:
-        logger.warning("Keine Materialien in der Datenbank gefunden.")
-        return
+    # ── 1. Material-IDs bestimmen ─────────────────────────────────────
+    if only_phase_change:
+        ids = list_switching_materials(db_path)
+        if not ids:
+            print("Keine switching-Materialien (mit T_switch) in der DB gefunden.")
+            return
+    else:
+        ids = list_material_ids(db_path)
+        if not ids:
+            logger.warning("Keine Materialien in der Datenbank gefunden.")
+            return
 
-    # ── 1. Alle Materialien bewerten ───────────────────────────────────
-    # Cache: Formel → Scores (viele Strukturen teilen sich dieselbe Formel)
-    score_cache: dict[str, dict] = {}
+    # ── 2. Scores berechnen oder aus DB laden ─────────────────────────
     rows: list[dict] = []
+    n_computed = 0
+    n_cached = 0
 
     for mid in ids:
         mat = load_result(db_path, mid)
 
-        # Filter: Phasenwechsel vorhanden?
-        if only_phase_change and mat.t_switch is None:
-            continue
-
-        # Status-Filter: nur konvergierte oder dezidierte Materialien
         if mat.status == "diverged":
             continue
 
-        # Optische Scores berechnen (mit Formel-Cache)
-        if mat.formula not in score_cache:
+        # Bereits berechnete Scores aus DB laden?
+        if not recompute and mat.total_score is not None:
+            n_cached += 1
+            scores = {
+                "cooling_score": mat.cooling_score,
+                "heating_score": mat.heating_score,
+                "total_score": mat.total_score,
+            }
+        else:
+            # Strukturbasierte Scores berechnen
             try:
-                score_cache[mat.formula] = compute_optical_scores(mat.formula)
-            except Exception:
-                score_cache[mat.formula] = None
+                scores = compute_optical_scores(mat.formula, mat=mat)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Optik-Berechnung fehlgeschlagen für %s: %s", mid, exc)
+                continue
 
-        scores = score_cache[mat.formula]
-        if scores is None:
-            continue
+            # In DB persistieren
+            store_optical_scores(
+                db_path, mid,
+                scores["cooling_score"],
+                scores["heating_score"],
+                scores["total_score"],
+            )
+            n_computed += 1
 
         rows.append({
             "material_id": mat.material_id,
@@ -433,13 +462,15 @@ def rank_materials(
         })
 
     if not rows:
-        print("Keine Materialien mit Phasenwechsel gefunden.")
+        print("Keine Materialien für Ranking gefunden.")
         return
 
-    # ── 2. Nach Total-Score sortieren ──────────────────────────────────
+    print(f"\n  Optische Auswertung: {n_computed} neu berechnet, {n_cached} aus DB geladen.")
+
+    # ── 3. Nach Total-Score sortieren ─────────────────────────────────
     rows.sort(key=lambda r: r["total_score"], reverse=True)
 
-    # ── 3. Tabelle ausgeben ────────────────────────────────────────────
+    # ── 4. Tabelle ausgeben ───────────────────────────────────────────
     print("=" * 100)
     print(f"  Ranking — Top {min(top, len(rows))} von {len(rows)} Materialien (sortiert nach Total-Score)")
     if only_phase_change:
@@ -459,7 +490,7 @@ def rank_materials(
 
     print("=" * 100)
 
-    # ── 4. Dashboards für Top-Kandidaten erzeugen ──────────────────────
+    # ── 5. Dashboards für Top-Kandidaten erzeugen ─────────────────────
     if output_dir is not None:
         output_dir = Path(output_dir)
     else:
@@ -494,10 +525,10 @@ def analyze_material(
 
     print(optical_pre_evaluation(mat))
 
-    # Mie-Streuungs-Analyse mit Cooling-Score
+    # Mie-Streuungs-Analyse mit Cooling-Score (strukturbasiert)
     from .optics import optical_summary
     try:
-        mie_result = optical_summary(mat.formula)
+        mie_result = optical_summary(mat.formula, mat=mat)
         print(mie_result["report"])
     except Exception as exc:  # noqa: BLE001
         logger.warning("Mie-Analyse fehlgeschlagen für %s: %s", mat.formula, exc)
@@ -524,7 +555,7 @@ def analyze_all(
 
         from .optics import optical_summary
         try:
-            mie_result = optical_summary(mat.formula)
+            mie_result = optical_summary(mat.formula, mat=mat)
             print(mie_result["report"])
         except Exception as exc:  # noqa: BLE001
             logger.warning("Mie-Analyse fehlgeschlagen für %s: %s", mat.formula, exc)

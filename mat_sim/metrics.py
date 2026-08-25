@@ -27,6 +27,8 @@ class StepMetrics:
     rdf_r: np.ndarray = field(repr=False)
     rdf_g: np.ndarray = field(repr=False)
     ql: float = 0.0                    # Steinhardt Q4 (kubisch/tetraedrisch)
+    positions: np.ndarray | None = field(default=None, repr=False)  # (N, 3)
+    cell: np.ndarray | None = field(default=None, repr=False)       # (3, 3)
 
 
 @dataclass
@@ -39,6 +41,9 @@ class TrajectoryResult:
     msd_values: list[float] = field(default_factory=list)
     ql_values: list[float] = field(default_factory=list)
     rdf_history: list[tuple[np.ndarray, np.ndarray]] = field(default_factory=list)
+    # Struktur-Snapshots pro Temperaturschritt (Positionen + Zelle)
+    positions_history: list[np.ndarray] = field(default_factory=list)  # (N, 3)
+    cell_history: list[np.ndarray] = field(default_factory=list)       # (3, 3)
 
     # ← später bestimmte Schwellwerte
     t_switch: float | None = None
@@ -55,6 +60,10 @@ class TrajectoryResult:
         self.msd_values.append(m.msd)
         self.ql_values.append(m.ql)
         self.rdf_history.append((m.rdf_r, m.rdf_g))
+        if m.positions is not None:
+            self.positions_history.append(m.positions)
+        if m.cell is not None:
+            self.cell_history.append(m.cell)
 
 
 # ── Hilfs: Nächste-Nachbar-Abstand ─────────────────────────────────────────
