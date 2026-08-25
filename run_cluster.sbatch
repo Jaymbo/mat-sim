@@ -50,6 +50,19 @@ echo "[$(date)] Worker beendet. Exit-Code: $TRAIN_EXIT"
 # Queue-Statistik nach Abschluss
 uv run python -m mat_sim.run --queue-stats --db results.db
 
-# Exit-Code 88 = Time-Out (Dispatcher reicht ggf. neuen Job ein)
-# Exit-Code 0 = Queue leer
+# ── Self-Rescheduling: wenn noch pending in der Queue → neuen Job einreichen ─
+PENDING=$(uv run python -c "
+from mat_sim.storage import queue_stats
+print(queue_stats('results.db')['pending'])
+" 2>/dev/null)
+
+if [ "$TRAIN_EXIT" -eq 88 ] && [ "${PENDING:-0}" -gt 0 ]; then
+    echo "[$(date)] Time-Out + $PENDING pending → reiche neuen Job ein …"
+    sbatch run_cluster.sbatch
+elif [ "$TRAIN_EXIT" -eq 0 ]; then
+    echo "[$(date)] Queue leer — kein Neustart nötig."
+else
+    echo "[$(date)] Exit $TRAIN_EXIT — kein Auto-Rescheduling."
+fi
+
 exit $TRAIN_EXIT
