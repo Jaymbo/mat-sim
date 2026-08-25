@@ -284,6 +284,122 @@ def detect_t_switch(
     return None
 
 
+# ── Phasenwechsel-Erkennung aus Skalar-Zeitreihen ──────────────────────────
+def detect_t_switch_from_scalars(
+    volumes: Sequence[float],
+    ql_values: Sequence[float],
+    temperatures: Sequence[float],
+    volume_threshold: float = 0.03,
+    ql_threshold: float = 0.10,
+    min_persistence: int = 3,
+) -> float | None:
+    """T_switch aus Volumen- und Q4-Zeitreihen ableiten (ohne RDF-History).
+
+    Diese Funktion ist ein **Fallback** für ältere DB-Einträge, die keine
+    vollständige RDF-History gespeichert haben.  Sie nutzt zwei Signale:
+
+    1. **Volumensprung**: Diskontinuierliche relative Volumenänderung
+       > ``volume_threshold`` (Default 3 %) zwischen aufeinanderfolgenden
+       Temperaturschritten.
+    2. **Q4-Sprung**: Diskontinuierliche Änderung des Steinhardt-Parameters
+       > ``ql_threshold`` (Default 0.10), die auf Symmetrie-Bruch hinweist.
+
+    Ein Phasenwechsel wird detektiert, wenn **mindestens eines** der beiden
+    Signale einen Sprung zeigt.  Wenn beide Signale springen, erhöht sich
+    die Konfidenz (aber das Ergebnis ist derselbe T_switch).
+
+    Parameters
+    ----------
+    volumes
+        Volumen-Zeitreihe (Å³), eine pro Temperaturschritt.
+    ql_values
+        Q4-Zeitreihe, eine pro Temperaturschritt.
+    temperatures
+        Temperaturwerte (K), eine pro Schritt.
+    volume_threshold
+        Mindest relative Volumenänderung für einen Sprung (Default: 0.03 = 3 %).
+    ql_threshold
+        Mindest absolute Q4-Änderung für einen Sprung (Default: 0.10).
+    min_persistence
+        Anzahl aufeinanderfolgender Schritte, für die der Sprung bestehen
+        bleiben muss (Default: 3).  Filtert transientes Rauschen.
+
+    Returns
+    -------
+    float | None
+        Temperatur des ersten detektierten Sprungs oder *None*.
+    """
+    n = len(temperatures)
+    if n < min_persistence + 2:
+        return None
+
+    vols = np.asarray(volumes, dtype=float)
+    qls = np.asarray(ql_values, dtype=float)
+
+    for idx in range(1, n):
+        # ── Volumensprung ─────────────────────────────────────────────
+        v_before = vols[idx - 1]
+        v_after = vols[idx]
+        vol_jump = False
+        if v_before > 0:
+            rel_vol = abs(v_after - v_before) / v_before
+            vol_jump = rel_vol > volume_threshold
+
+        # ── Q4-Sprung ─────────────────────────────────────────────────
+        ql_jump = abs(qls[idx] - qls[idx - 1]) > ql_threshold
+
+        if not (vol_jump or ql_jump):
+            continue
+
+        # ── Spike-Recovery ausschließen ───────────────────────────────
+        # Ein Ausreißer (Spike über 1–n Schritte) erzeugt beim Zurückkehren
+        # einen scheinbaren Sprung.  Wir vergleichen den aktuellen Wert
+        # gegen ein Fenster von Werten vor dem Sprung (idx-2 bis
+        # idx-(min_persistence+1)).  Wenn der aktuelle Wert nahe an einem
+        # dieser Vor-Spike-Werte liegt, ist es eine Erholung, kein Wechsel.
+        lookback = min(min_persistence + 1, idx)
+        if idx >= 2 and (vol_jump or ql_jump):
+            for back in range(2, lookback + 1):
+                v_prev = vols[idx - back]
+                if vol_jump and v_prev > 0:
+                    if abs(v_after - v_prev) / v_prev < volume_threshold:
+                        vol_jump = False
+                if ql_jump:
+                    if abs(qls[idx] - qls[idx - back]) < ql_threshold:
+                        ql_jump = False
+                if not (vol_jump or ql_jump):
+                    break
+            if not (vol_jump or ql_jump):
+                continue
+
+        # ── Persistenz-Check ──────────────────────────────────────────
+        # Der Sprung muss für min_persistence weitere Schritte bestehen
+        # bleiben: Volumen oder Q4 bleibt deutlich verschoben gegenüber
+        # dem Wert *vor* dem Sprung.
+        persistent = True
+        v_ref = vols[idx - 1]   # Referenz vor Sprung
+        ql_ref = qls[idx - 1]
+        for k in range(idx + 1, min(idx + 1 + min_persistence, n)):
+            v_k = vols[k]
+            ql_k = qls[k]
+
+            vol_still_shifted = (
+                v_ref > 0 and abs(v_k - v_ref) / v_ref > volume_threshold
+            ) if vol_jump else False
+            ql_still_shifted = (
+                abs(ql_k - ql_ref) > ql_threshold
+            ) if ql_jump else False
+
+            if not (vol_still_shifted or ql_still_shifted):
+                persistent = False
+                break
+
+        if persistent:
+            return float(temperatures[idx])
+
+    return None
+
+
 # ── Zerfalls-Erkennung aus MSD ─────────────────────────────────────────────
 def detect_t_decay(
     msd_values: Sequence[float],

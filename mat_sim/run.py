@@ -259,13 +259,16 @@ def _run_reset_stale(args: argparse.Namespace) -> int:
 # ── Recheck-Switch ─────────────────────────────────────────────────────────
 
 def _run_recheck_switch(args: argparse.Namespace) -> int:
-    """T_switch für alle Materialien mit gespeicherten RDFs neu auswerten.
+    """T_switch für alle Materialien neu auswerten.
 
-    Nutzt die strengeren Kriterien (Persistenz-Check, Sprung vs. Ausdehnung,
-    Volumen-Bestätigung) auf der gespeicherten RDF-History.
+    Zweigeteilte Strategie:
+    1. **Mit RDF-History**: Strengere Kriterien (Persistenz-Check, Sprung
+       vs. Ausdehnung, Volumen-Bestätigung) auf der gespeicherten RDF-History.
+    2. **Ohne RDF-History** (alte DB-Einträge): Fallback über
+       ``detect_t_switch_from_scalars()`` — nutzt Volumen- und Q4-Zeitreihen.
     """
     from .storage import list_material_ids, load_result, update_t_switch
-    from .metrics import detect_t_switch
+    from .metrics import detect_t_switch, detect_t_switch_from_scalars
 
     ids = list_material_ids(args.db)
     if not ids:
@@ -276,7 +279,9 @@ def _run_recheck_switch(args: argparse.Namespace) -> int:
     n_old_switch = 0
     n_new_switch = 0
     n_lost_switch = 0
-    n_no_rdf = 0
+    n_rdf_based = 0
+    n_scalar_based = 0
+    n_no_data = 0
 
     print(f"Re-check T_switch für {n_total} Materialien …")
 
@@ -284,22 +289,32 @@ def _run_recheck_switch(args: argparse.Namespace) -> int:
         mat = load_result(args.db, mid)
         old_t = mat.t_switch
 
-        # RDF-History verfügbar?
-        if mat.rdf_history is None or len(mat.rdf_history) < 2:
-            n_no_rdf += 1
-            # Alte Materialien ohne rdf_history: T_switch zurücksetzen
-            # (kann nicht nachgeprüft werden)
-            if old_t is not None:
-                update_t_switch(args.db, mid, None)
-                n_lost_switch += 1
-            continue
+        new_t: float | None = None
 
-        # Neue Detektion mit strengeren Kriterien
-        new_t = detect_t_switch(
-            mat.rdf_history,
-            mat.temperatures,
-            volumes=mat.volumes,
-        )
+        # ── Strategie 1: RDF-History verfügbar ────────────────────────
+        if mat.rdf_history is not None and len(mat.rdf_history) >= 2:
+            new_t = detect_t_switch(
+                mat.rdf_history,
+                mat.temperatures,
+                volumes=mat.volumes,
+            )
+            if new_t is not None:
+                n_rdf_based += 1
+
+        # ── Strategie 2: Fallback aus Skalar-Zeitreihen ───────────────
+        if new_t is None and len(mat.volumes) >= 2 and len(mat.ql_values) >= 2:
+            new_t = detect_t_switch_from_scalars(
+                mat.volumes,
+                mat.ql_values,
+                mat.temperatures,
+            )
+            if new_t is not None:
+                n_scalar_based += 1
+
+        if new_t is None and (
+            len(mat.volumes) < 2 or len(mat.ql_values) < 2
+        ) and (mat.rdf_history is None or len(mat.rdf_history) < 2):
+            n_no_data += 1
 
         if old_t is not None:
             n_old_switch += 1
@@ -315,13 +330,15 @@ def _run_recheck_switch(args: argparse.Namespace) -> int:
         if i % 100 == 0:
             print(f"  … {i}/{n_total} geprüft", flush=True)
 
-    print(f"\nErgebnis Re-check:")
+    print("\nErgebnis Re-check:")
     print(f"  Total geprüft:      {n_total}")
     print(f"  Alte T_switch:      {n_old_switch}")
     print(f"  Neue T_switch:      {n_new_switch}")
-    print(f"  Verlorene Switches: {n_lost_switch} (false positives)")
-    print(f"  Ohne RDF-History:   {n_no_rdf}")
-    print(f"  → {n_old_switch - n_lost_switch} bleiben, {n_new_switch} gesamt")
+    print(f"    davon RDF-basiert:    {n_rdf_based}")
+    print(f"    davon Skalar-basiert: {n_scalar_based}")
+    print(f"  Verlorene Switches: {n_lost_switch}")
+    print(f"  Keine Daten:        {n_no_data}")
+    print(f"  → {n_new_switch} gesamt")
     return 0
 
 
