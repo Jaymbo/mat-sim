@@ -394,7 +394,10 @@ def rank_materials(
         return
 
     # ── 1. Alle Materialien bewerten ───────────────────────────────────
+    # Cache: Formel → Scores (viele Strukturen teilen sich dieselbe Formel)
+    score_cache: dict[str, dict] = {}
     rows: list[dict] = []
+
     for mid in ids:
         mat = load_result(db_path, mid)
 
@@ -406,10 +409,15 @@ def rank_materials(
         if mat.status == "diverged":
             continue
 
-        # Optische Scores berechnen
-        try:
-            scores = compute_optical_scores(mat.formula)
-        except Exception:
+        # Optische Scores berechnen (mit Formel-Cache)
+        if mat.formula not in score_cache:
+            try:
+                score_cache[mat.formula] = compute_optical_scores(mat.formula)
+            except Exception:
+                score_cache[mat.formula] = None
+
+        scores = score_cache[mat.formula]
+        if scores is None:
             continue
 
         rows.append({
