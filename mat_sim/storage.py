@@ -26,9 +26,9 @@ import json
 import logging
 import sqlite3
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 
@@ -81,6 +81,7 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
             cooling_score   REAL,
             heating_score   REAL,
             total_score     REAL,
+            contrast_score  REAL,
             optical_evaluated TIMESTAMP,
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -94,6 +95,7 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         "cooling_score": "REAL",
         "heating_score": "REAL",
         "total_score": "REAL",
+        "contrast_score": "REAL",
         "optical_evaluated": "TIMESTAMP",
     })
 
@@ -245,19 +247,39 @@ def store_optical_scores(
     cooling_score: float,
     heating_score: float,
     total_score: float,
+    contrast_score: float | None = None,
 ) -> None:
-    """Optische Scores für ein Material in der DB persistieren."""
+    """Optische Scores für ein Material in der DB persistieren.
+
+    Parameters
+    ----------
+    contrast_score
+        Optionaler Switching-Kontrast-Score (0–100).  Wird ignoriert,
+        wenn *None* (Abwärtskompatibilität).
+    """
     conn = init_db(db_path)
     try:
-        conn.execute(
-            """
-            UPDATE materials
-            SET cooling_score = ?, heating_score = ?, total_score = ?,
-                optical_evaluated = CURRENT_TIMESTAMP
-            WHERE material_id = ?
-            """,
-            (cooling_score, heating_score, total_score, material_id),
-        )
+        if contrast_score is not None:
+            conn.execute(
+                """
+                UPDATE materials
+                SET cooling_score = ?, heating_score = ?, total_score = ?,
+                    contrast_score = ?, optical_evaluated = CURRENT_TIMESTAMP
+                WHERE material_id = ?
+                """,
+                (cooling_score, heating_score, total_score,
+                 contrast_score, material_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE materials
+                SET cooling_score = ?, heating_score = ?, total_score = ?,
+                    optical_evaluated = CURRENT_TIMESTAMP
+                WHERE material_id = ?
+                """,
+                (cooling_score, heating_score, total_score, material_id),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -350,6 +372,7 @@ class StoredMaterial:
     cooling_score: float | None = None
     heating_score: float | None = None
     total_score: float | None = None
+    contrast_score: float | None = None
     optical_evaluated: str | None = None
 
 
@@ -375,7 +398,8 @@ def load_result(db_path: str | Path, material_id: str) -> StoredMaterial:
             "rdf_before_json, rdf_after_json, "
             "temperatures, msd_values, ql_values, volumes, energies, "
             "structure_before_json, structure_after_json, rdf_history_json, "
-            "cooling_score, heating_score, total_score, optical_evaluated "
+            "cooling_score, heating_score, total_score, contrast_score, "
+            "optical_evaluated "
             "FROM materials WHERE material_id = ?",
             (material_id,),
         ).fetchone()
@@ -404,7 +428,8 @@ def load_result(db_path: str | Path, material_id: str) -> StoredMaterial:
         cooling_score=row[15],
         heating_score=row[16],
         total_score=row[17],
-        optical_evaluated=row[18],
+        contrast_score=row[18],
+        optical_evaluated=row[19],
     )
 
 

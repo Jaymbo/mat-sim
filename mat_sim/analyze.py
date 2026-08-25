@@ -21,19 +21,24 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 
-from .storage import StoredMaterial, load_result, list_material_ids, list_switching_materials, store_optical_scores
+from .storage import (
+    StoredMaterial,
+    list_material_ids,
+    list_switching_materials,
+    load_result,
+    store_optical_scores,
+)
 
 logger = logging.getLogger(__name__)
 
 # ── Matplotlib (non-interactive Default) ────────────────────────────────────
 import matplotlib
+
 matplotlib.use("Agg")  # sicher für Headless-Server; wird bei --show überschrieben
 import matplotlib.pyplot as plt
-
 
 # ── Plot-Hilfsfunktionen ────────────────────────────────────────────────────
 
@@ -207,19 +212,21 @@ def _plot_optical_spectrum(ax, mat: StoredMaterial, quantity: str = "sca") -> No
     ax.grid(True, alpha=0.3)
     ax.set_xlim(left=0)
 
-    # Alle drei Scores als Text-Annotation
+    # Alle Scores als Text-Annotation
     cooling = result["cooling_score"]
     heating = result["heating_score"]
     total = result["total_score"]
+    contrast = result["contrast_score"]
     score_text = (
-        f"Cooling: {cooling:.0f}%\n"
-        f"Heating: {heating:.0f}%\n"
-        f"Total:   {total:.0f}%"
+        f"Cooling:  {cooling:.0f}%\n"
+        f"Heating:  {heating:.0f}%\n"
+        f"Kontrast: {contrast:.0f}%\n"
+        f"Total:    {total:.0f}%"
     )
     ax.text(0.98, 0.95, score_text,
             transform=ax.transAxes, ha="right", va="top",
             fontsize=8, fontweight="bold", family="monospace",
-            bbox=dict(boxstyle="round,pad=0.4", facecolor="wheat", alpha=0.9))
+            bbox={"boxstyle": "round,pad=0.4", "facecolor": "wheat", "alpha": 0.9})
 
 
 # ── Dashboard ───────────────────────────────────────────────────────────────
@@ -431,6 +438,7 @@ def rank_materials(
                 "cooling_score": mat.cooling_score,
                 "heating_score": mat.heating_score,
                 "total_score": mat.total_score,
+                "contrast_score": mat.contrast_score,
             }
         else:
             # Strukturbasierte Scores berechnen
@@ -446,6 +454,7 @@ def rank_materials(
                 scores["cooling_score"],
                 scores["heating_score"],
                 scores["total_score"],
+                contrast_score=scores["contrast_score"],
             )
             n_computed += 1
 
@@ -458,6 +467,7 @@ def rank_materials(
             "cooling_score": scores["cooling_score"],
             "heating_score": scores["heating_score"],
             "total_score": scores["total_score"],
+            "contrast_score": scores.get("contrast_score"),
             "mat": mat,
         })
 
@@ -471,24 +481,25 @@ def rank_materials(
     rows.sort(key=lambda r: r["total_score"], reverse=True)
 
     # ── 4. Tabelle ausgeben ───────────────────────────────────────────
-    print("=" * 100)
+    print("=" * 110)
     print(f"  Ranking — Top {min(top, len(rows))} von {len(rows)} Materialien (sortiert nach Total-Score)")
     if only_phase_change:
         print("  Filter: nur Materialien mit detektiertem Phasenwechsel (T_switch)")
-    print("=" * 100)
-    print(f"  {'#':>3}  {'MP-ID':<14} {'Formel':<16} {'T_switch':>9} {'T_decay':>9} {'Cool%':>6} {'Heat%':>6} {'Total':>6}")
-    print("-" * 100)
+    print("=" * 110)
+    print(f"  {'#':>3}  {'MP-ID':<14} {'Formel':<16} {'T_switch':>9} {'T_decay':>9} {'Cool%':>6} {'Heat%':>6} {'Kontr%':>6} {'Total':>6}")
+    print("-" * 110)
 
     for i, r in enumerate(rows[:top], start=1):
         ts = f"{r['t_switch']:.0f} K" if r['t_switch'] is not None else "—"
         td = f"{r['t_decay']:.0f} K" if r['t_decay'] is not None else "—"
+        kontr = f"{r['contrast_score']:.1f}" if r['contrast_score'] is not None else "—"
         print(
             f"  {i:>3}  {r['material_id']:<14} {r['formula']:<16} "
             f"{ts:>9} {td:>9} "
-            f"{r['cooling_score']:>6.1f} {r['heating_score']:>6.1f} {r['total_score']:>6.1f}"
+            f"{r['cooling_score']:>6.1f} {r['heating_score']:>6.1f} {kontr:>6} {r['total_score']:>6.1f}"
         )
 
-    print("=" * 100)
+    print("=" * 110)
 
     # ── 5. Dashboards für Top-Kandidaten erzeugen ─────────────────────
     if output_dir is not None:

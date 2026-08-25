@@ -6,7 +6,7 @@ Implementiert:
   2. Mie-Streu-Berechnung mit PyMieScatt (Q_sca, Q_abs, Q_ext)
   3. Cooling-Efficiency-Score (heisser Zustand)  — Solar-Reflexion + IR-Emissivität
   4. Heating-Efficiency-Score (kalter Zustand)   — Solar-Absorption + IR-Rückhaltung
-  5. Smart-Textile-Total-Score (arithmetisches Mittel)
+  5. Smart-Textile-Total-Score (arithmetisches Mittel + Kontrast-Bonus)
 
 Wellenlängen-Grids [nm]:
   - Solar:               300–2500 nm  (0.3–2.5 µm)
@@ -24,10 +24,11 @@ import numpy as np
 
 # ── PyMieScatt: SciPy 1.17 Kompatibilität (trapz → trapezoid) ──────────────
 import scipy.integrate as _si
+
 if not hasattr(_si, "trapz"):
     _si.trapz = _si.trapezoid
 
-from PyMieScatt import MieQ  # noqa: E402
+from PyMieScatt import MieQ
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +45,20 @@ FULL_WAVELENGTHS_NM = np.concatenate([
     IR_WINDOW_WAVELENGTHS_NM,
 ])
 
-# Solar-Spektral-Gewichtung (vereinfachte AM1.5-G, normiert)
-_AM15_PEAK_NM = 500.0
-_AM15_SIGMA_NM = 350.0
+# ── AM1.5-G Solar-Spektral-Gewichtung (3-Gaussian-Approximation) ───────────
+# Die AM1.5-G Sonnenspektrale Bestrahlungsstärke (global, 300–2500 nm) wird
+# durch drei Gauß-Komponenten approximiert:
+#   1. UV-blau   (peak ~475 nm, schmal)  — Hauptmaximum der Sonnenstrahlung
+#   2. Visible   (peak ~650 nm, breit)   — roter Schulter
+#   3. NIR       (peak ~1000 nm, breit)  — Infrarot-Anteil (wichtig für Reflexion)
+# Gewichte approximieren die relativen Integrale der AM1.5G-Spektren.
+# Ref: ASTM G173-03, approximiert mit Gaussian Mixture Fit.
+_AM15_GAUSSIANS: list[tuple[float, float, float]] = [
+    # (weight, peak_nm, sigma_nm)
+    (0.45, 475.0, 120.0),   # UV-blau Hauptpeak
+    (0.30, 700.0, 200.0),   # Visible/rote Schulter
+    (0.25, 1000.0, 350.0),  # NIR-Anteil
+]
 
 
 # ── Drude-Lorentz-Modell ────────────────────────────────────────────────────
@@ -177,8 +189,17 @@ def _nn_distance_to_bandgap(d_nn: float) -> float:
 def _q4_to_drude_strength(q4: float, volume: float, n_atoms: int) -> tuple[float, float]:
     """Steinhardt Q4 → Drude-Parameter (ω_p, γ_d).
 
-    Hoher Q4 (kristallin, geordnet) → kein freie Elektronen → ω_p ≈ 0
-    Niedriger Q4 (Symmetriebruch, amorph/metallisch) → freie Elektronen → ω_p > 0
+    Kontinuierliche, sensitive Abbildung des Q4-Ordnungsparameters auf
+    den Metallisierungsgrad:
+
+      - Q4 ≥ 0.6  → eindeutig kristallin/isolierend → ω_p = 0
+      - Q4 ≈ 0.5  → schwache Störung → geringe ω_p
+      - Q4 ≈ 0.3  → starke Störung → moderate ω_p
+      - Q4 ≈ 0.1  → stark amorph/metallisch → hohe ω_p
+
+    Verwendet eine **quadratische** statt linearen Abbildung, um im
+    mittleren Bereich (0.3–0.5, wo die meisten Oxide liegen) empfindlicher
+    zu sein.
 
     Returns
     -------
@@ -186,21 +207,20 @@ def _q4_to_drude_strength(q4: float, volume: float, n_atoms: int) -> tuple[float
         Plasmafrequenz und Dämpfung in eV.
     """
     # Q4-Bereich für Oxide: typisch 0.1–0.8
-    # Q4 > 0.5 → stark geordnet → isolierend
-    # Q4 < 0.3 → stark gestört → metallisch
-    if q4 > 0.5:
-        return 0.0, 0.0  # Isolator, kein Drude-Term
-
-    # Linearer Übergang: Q4=0.3 → stark metallisch, Q4=0.5 → schwach
-    metallicity = max(0.0, (0.5 - q4) / 0.2)  # 0 … 1
+    # Kontinuierliche quadratische Abbildung:
+    #   metallicity = clamp((0.6 - Q4) / 0.5, 0, 1)²
+    # Q4=0.6 → 0, Q4=0.35 → 0.25, Q4=0.1 → 1.0
+    raw_metallicity = max(0.0, (0.6 - q4) / 0.5)
+    metallicity = raw_metallicity ** 2  # quadratisch → empfindlicher im Mittelbereich
 
     # Dichte-Einfluss: höhere Dichte → mehr freie Elektronen → höhere ω_p
     density = n_atoms / volume if volume > 0 else 0.0  # Atome/Å³
     # Typische Oxid-Dichte: 0.05–0.15 Atome/Å³
     density_factor = min(density / 0.1, 2.0)
 
-    omega_p = metallicity * density_factor * 4.0  # max ~8 eV für starke Metalle
-    gamma_d = 0.3 + metallicity * 0.5  # 0.3–0.8 eV
+    # Maximale ω_p ~12 eV für stark metallische, dichte Oxide
+    omega_p = metallicity * density_factor * 6.0
+    gamma_d = 0.2 + metallicity * 0.6  # 0.2–0.8 eV
     return omega_p, gamma_d
 
 
@@ -213,6 +233,25 @@ def _volume_to_eps_inf(volume: float, n_atoms: int) -> float:
     # Typische Oxid-Dichte 0.05–0.15 → ε_inf 2–6
     eps_inf = 1.0 + density * 40.0
     return float(np.clip(eps_inf, 1.5, 8.0))
+
+
+def _estimate_particle_radius_nm(rdf: tuple[np.ndarray, np.ndarray] | None) -> float:
+    """Partikelradius aus RDF-Struktur ableiten.
+
+    Für Nanopartikel-Suspensionen sollte der Radius im Bereich der
+    Kohärenzlänge der Kristallstruktur liegen.  Wir approximieren
+    den Partikelradius als ~50× den Nächste-Nachbar-Abstand (typisch
+    1.5–3 Å → 75–150 nm), was einer Domänengröße von ~10 Einheitszellen
+    entspricht — realistisch für sol-gel synthetisierte Nanopartikel.
+
+    Ohne RDF wird der Default-Wert (500 nm) zurückgegeben.
+    """
+    d_nn = _rdf_first_peak(rdf)
+    if d_nn is None or d_nn < 0.5:
+        return 500.0
+    # 50 × d_nn (Å) → nm:  d_nn [Å] * 50 / 10 = d_nn * 5
+    radius = d_nn * 5.0  # z.B. d_nn=2.0 Å → 100 nm
+    return float(np.clip(radius, 50.0, 500.0))
 
 
 def derive_dielectric_model(
@@ -253,7 +292,7 @@ def derive_dielectric_model(
         e_gap = max(_nn_distance_to_bandgap(d_nn), 0.3)
         # Lorentz-Oszillator an der Bandlücken-Energie
         # Stärke sinkt mit Drude-Term (Metall schirmt Interband ab)
-        interband_strength = 2.0 * (1.0 - omega_p / 8.0) if omega_p > 0 else 2.0
+        interband_strength = 2.0 * (1.0 - omega_p / 12.0) if omega_p > 0 else 2.0
         lorentz.append(LorentzOscillator(
             omega_0=e_gap, gamma=0.3, f=max(interband_strength, 0.5),
         ))
@@ -385,6 +424,8 @@ def simulate_mie_spectrum(
         ``model`` None ist).
     state
         ``"kalt"`` oder ``"heiss"`` (nur für Legacy-Fallback).
+    particle_radius_nm
+        Partikelradius für Mie-Streuung in nm.
     model
         Wenn angegeben, wird dieses DielectricModel direkt verwendet
         (strukturbasierter Pfad).  Wenn *None*, wird das Legacy-Modell
@@ -433,46 +474,79 @@ def simulate_mie_spectrum(
 # ── Score-Hilfsfunktionen ───────────────────────────────────────────────────
 
 def _am15_weights(wavelengths_nm: np.ndarray) -> np.ndarray:
-    """Gauss-Approximation der AM1.5-G Solarstrahlung, normiert."""
-    weights = np.exp(-0.5 * ((wavelengths_nm - _AM15_PEAK_NM) / _AM15_SIGMA_NM) ** 2)
-    weights /= weights.sum()
+    """3-Gaussian-Approximation der AM1.5-G Solarstrahlung, normiert.
+
+    Drei Gauß-Komponenten approximieren die AM1.5G Sonnenspektrale
+    Bestrahlungsstärke im Bereich 300–2500 nm:
+
+      1. UV-blau   (peak ~475 nm, sigma ~120 nm)  — 45% der Energie
+      2. Visible   (peak ~700 nm, sigma ~200 nm)  — 30%
+      3. NIR       (peak ~1000 nm, sigma ~350 nm) — 25%
+
+    Das NIR-Band (700–2500 nm) ist wichtig für die Solar-Reflexions-Bewertung,
+    da hier die Mie-Streuung von Oxid-Nanopartikeln stark variiert.
+    """
+    weights = np.zeros_like(wavelengths_nm, dtype=float)
+    for weight, peak, sigma in _AM15_GAUSSIANS:
+        weights += weight * np.exp(
+            -0.5 * ((wavelengths_nm - peak) / sigma) ** 2
+        )
+    norm = weights.sum()
+    if norm > 0:
+        weights /= norm
     return weights
 
 
 def _solar_reflectance(q_sca: np.ndarray, q_ext: np.ndarray, wls: np.ndarray) -> float:
-    """Gewichtete Solar-Reflexion (0–1) aus Q_sca/Q_ext."""
-    mask = np.isin(wls, SOLAR_WAVELENGTHS_NM) | (
-        (wls >= SOLAR_WAVELENGTHS_NM[0]) & (wls <= SOLAR_WAVELENGTHS_NM[-1])
-    )
+    """Gewichtete Solar-Reflexion (0–1) aus Q_sca/Q_ext (Albedo-basiert).
+
+    Die Reflexion eines Partikels ist der Streu-Anteil am Extinktions-
+    querschnitt: Q_sca / Q_ext.  Dieser Wert ist von Natur aus 0–1
+    (keine willkürliche Normierung nötig).
+    """
+    mask = (wls >= SOLAR_WAVELENGTHS_NM[0]) & (wls <= SOLAR_WAVELENGTHS_NM[-1])
     if not np.any(mask):
         return 0.0
     wls_s = wls[mask]
     qs_s = q_sca[mask]
     qe_s = q_ext[mask]
     weights = _am15_weights(wls_s)
-    ratio = np.where(qe_s > 1e-10, qs_s / qe_s, 0.0)
+    ratio = np.divide(qs_s, qe_s, out=np.zeros_like(qs_s), where=qe_s > 1e-10)
     return float(np.clip(np.sum(weights * ratio), 0.0, 1.0))
 
 
-def _solar_absorption(q_abs: np.ndarray, wls: np.ndarray) -> float:
-    """Gewichtete Solar-Absorption (0–1) aus Q_abs."""
+def _solar_absorption(q_abs: np.ndarray, q_ext: np.ndarray, wls: np.ndarray) -> float:
+    """Gewichtete Solar-Absorption (0–1) aus Q_abs/Q_ext (Albedo-basiert).
+
+    Die Absorption ist der Absorptions-Anteil am Extinktionsquerschnitt:
+    Q_abs / Q_ext.  Dieser Wert ist von Natur aus 0–1, da
+    Q_abs = Q_ext - Q_sca ≤ Q_ext.
+    """
     mask = (wls >= SOLAR_WAVELENGTHS_NM[0]) & (wls <= SOLAR_WAVELENGTHS_NM[-1])
     if not np.any(mask):
         return 0.0
     wls_s = wls[mask]
     qa_s = q_abs[mask]
+    qe_s = q_ext[mask]
     weights = _am15_weights(wls_s)
-    # Q_abs kann > 2; /2 als grobe Normierung
-    return float(np.clip(np.sum(weights * qa_s) / 2.0, 0.0, 1.0))
+    ratio = np.divide(qa_s, qe_s, out=np.zeros_like(qa_s), where=qe_s > 1e-10)
+    return float(np.clip(np.sum(weights * ratio), 0.0, 1.0))
 
 
-def _ir_emissivity(q_abs: np.ndarray, wls: np.ndarray) -> float:
-    """IR-Emissivität (0–1) im atmosphärischen Fenster (8–13 µm)."""
+def _ir_emissivity(q_abs: np.ndarray, q_ext: np.ndarray, wls: np.ndarray) -> float:
+    """IR-Emissivität (0–1) im atmosphärischen Fenster (8–13 µm).
+
+    Verwendet Q_abs/Q_ext statt der rohen /2-Normierung.  Im IR-Fenster
+    dominieren Phonon-Resonanzen, die Q_abs/Q_ext nahe 1 bringen können
+    (starke Absorption = hohe Emissivität = gute Kühlung).
+    """
     mask = (wls >= IR_WINDOW_WAVELENGTHS_NM[0]) & (wls <= IR_WINDOW_WAVELENGTHS_NM[-1])
     if not np.any(mask):
         return 0.0
     qa_ir = q_abs[mask]
-    return float(np.clip(np.mean(qa_ir) / 2.0, 0.0, 1.0))
+    qe_ir = q_ext[mask]
+    ratio = np.divide(qa_ir, qe_ir, out=np.zeros_like(qa_ir), where=qe_ir > 1e-10)
+    return float(np.clip(np.mean(ratio), 0.0, 1.0))
 
 
 # ── Cooling- & Heating-Scores ───────────────────────────────────────────────
@@ -512,6 +586,35 @@ def _extract_state_params(
     return {"rdf": rdf, "q4": q4, "volume": volume, "n_atoms": n_atoms}
 
 
+def _switching_contrast(
+    solar_refl_cold: float,
+    solar_refl_hot: float,
+    solar_abs_cold: float,
+    solar_abs_hot: float,
+    ir_emiss_cold: float,
+    ir_emiss_hot: float,
+) -> float:
+    """Kontrast-Score (0–100) für den optischen Switching-Kontrast.
+
+    Belohnt Materialien, deren optische Eigenschaften sich am T_switch
+    **stark** ändern — das ist das Kernkriterium für "switchable"
+    radiative cooling.
+
+    Drei Kontrast-Komponenten:
+      1. |Δ Solar-Reflexion|  — je mehr Reflexions-Wechsel, desto besser
+      2. |Δ Solar-Absorption| — je mehr Absorptions-Wechsel, desto besser
+      3. |Δ IR-Emissivität|   — je mehr IR-Emissions-Wechsel, desto besser
+
+    Jede Komponente wird auf 0–1 normiert (Δ max = 1.0), dann gemittelt.
+    """
+    d_refl = abs(solar_refl_hot - solar_refl_cold)
+    d_abs = abs(solar_abs_hot - solar_abs_cold)
+    d_ir = abs(ir_emiss_hot - ir_emiss_cold)
+
+    contrast = (d_refl + d_abs + d_ir) / 3.0
+    return float(np.clip(contrast * 100.0, 0.0, 100.0))
+
+
 def compute_optical_scores(
     formula: str,
     particle_radius_nm: float = 500.0,
@@ -523,12 +626,19 @@ def compute_optical_scores(
     werden die Drude-Lorentz-Parameter aus den MD-Simulationsdaten abgeleitet
     (strukturbasierter Pfad).  Andernfalls wird das Legacy-Modell verwendet.
 
+    Scoring-Struktur
+    ----------------
+    - **Cooling-Score** (heiss): Solar-Reflexion (50%) + IR-Emissivität (50%)
+    - **Heating-Score** (kalt):  Solar-Absorption (50%) + IR-Rückhaltung (50%)
+    - **Kontrast-Bonus**:        |Δ optische Eigenschaften| zwischen kalt/heiss
+    - **Total-Score**:           70% arithmetisches Mittel + 30% Kontrast-Bonus
+
     Parameters
     ----------
     formula
         Chemische Formel (Legacy-Pfad).
     particle_radius_nm
-        Partikelradius für Mie-Streuung.
+        Partikelradius für Mie-Streuung.  Wenn 0, wird aus Struktur abgeleitet.
     mat
         Optional: StoredMaterial mit Simulationsdaten.  Wenn angegeben,
         werden die dielektrischen Modelle aus RDF, Q4 und Volumen abgeleitet.
@@ -559,13 +669,19 @@ def compute_optical_scores(
             volume=params_hot["volume"],
             n_atoms=params_hot["n_atoms"],
         )
+
+        # Partikelradius aus Struktur ableiten, wenn nicht explizit gesetzt
+        if particle_radius_nm == 500.0:
+            particle_radius_nm = _estimate_particle_radius_nm(params_cold["rdf"])
+
         logger.info(
             "Strukturbasierte Optik für %s: "
             "kalt(ε_inf=%.1f, ω_p=%.1f, Q4=%.2f) | "
-            "heiss(ε_inf=%.1f, ω_p=%.1f, Q4=%.2f)",
+            "heiss(ε_inf=%.1f, ω_p=%.1f, Q4=%.2f) | r=%.0f nm",
             mat.material_id,
             model_cold.eps_inf, model_cold.drude.omega_p, params_cold["q4"],
             model_hot.eps_inf, model_hot.drude.omega_p, params_hot["q4"],
+            particle_radius_nm,
         )
 
     # Spektren auf dem nahtlosen Gesamt-Grid berechnen
@@ -580,25 +696,37 @@ def compute_optical_scores(
 
     wls = spec_hot.wavelengths_nm
 
-    # ── Cooling (heiss) ──
-    solar_refl = _solar_reflectance(spec_hot.q_sca, spec_hot.q_ext, wls)
-    ir_emiss_hot = _ir_emissivity(spec_hot.q_abs, wls)
-    cooling_score = (solar_refl * 0.5 + ir_emiss_hot * 0.5) * 100.0
+    # ── Cooling (heiss) ── Albedo-basierte Normierung (Q/Q_ext)
+    solar_refl_hot = _solar_reflectance(spec_hot.q_sca, spec_hot.q_ext, wls)
+    ir_emiss_hot = _ir_emissivity(spec_hot.q_abs, spec_hot.q_ext, wls)
+    cooling_score = (solar_refl_hot * 0.5 + ir_emiss_hot * 0.5) * 100.0
 
     # ── Heating (kalt) ──
-    solar_abs_cold = _solar_absorption(spec_cold.q_abs, wls)
-    ir_emiss_cold = _ir_emissivity(spec_cold.q_abs, wls)
+    solar_abs_cold = _solar_absorption(spec_cold.q_abs, spec_cold.q_ext, wls)
+    ir_emiss_cold = _ir_emissivity(spec_cold.q_abs, spec_cold.q_ext, wls)
     # Niedrige IR-Emissivität ist gut → (1 - ir_emiss_cold)
     heating_score = (solar_abs_cold * 0.5 + (1.0 - ir_emiss_cold) * 0.5) * 100.0
 
-    # ── Total ──
-    total_score = (cooling_score + heating_score) / 2.0
+    # ── Kontrast-Bonus ── belohnt Materialien mit starkem optischem Switching
+    # Für den Kontrast brauchen wir auch die kalten/heissen Gegenstücke
+    solar_refl_cold = _solar_reflectance(spec_cold.q_sca, spec_cold.q_ext, wls)
+    solar_abs_hot = _solar_absorption(spec_hot.q_abs, spec_hot.q_ext, wls)
+    contrast_score = _switching_contrast(
+        solar_refl_cold, solar_refl_hot,
+        solar_abs_cold, solar_abs_hot,
+        ir_emiss_cold, ir_emiss_hot,
+    )
+
+    # ── Total ── 70% Basis + 30% Kontrast-Bonus
+    base_score = (cooling_score + heating_score) / 2.0
+    total_score = base_score * 0.7 + contrast_score * 0.3
 
     return {
         "cooling_score": round(cooling_score, 1),
         "heating_score": round(heating_score, 1),
         "total_score": round(total_score, 1),
-        "solar_reflectance": round(solar_refl, 3),
+        "contrast_score": round(contrast_score, 1),
+        "solar_reflectance": round(solar_refl_hot, 3),
         "solar_absorption_cold": round(solar_abs_cold, 3),
         "ir_emissivity_hot": round(ir_emiss_hot, 3),
         "ir_emissivity_cold": round(ir_emiss_cold, 3),
@@ -667,6 +795,9 @@ def optical_summary(formula: str, particle_radius_nm: float = 500.0, mat=None) -
         f"  Solar-Absorption:         {result['solar_absorption_cold']:.1%}",
         f"  IR-Rückhaltung (1-ε):     {1.0 - result['ir_emissivity_cold']:.1%}",
         f"  Heating-Score:            {result['heating_score']:.1f} / 100",
+        "",
+        "  ── Switching-Kontrast ──",
+        f"  Kontrast-Score:           {result['contrast_score']:.1f} / 100",
         "",
         "  ── Smart-Textile Gesamt ──",
         f"  Total Score:              {result['total_score']:.1f} / 100",
