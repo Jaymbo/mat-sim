@@ -275,6 +275,7 @@ class ThermalRamp:
             result.t_switch = detect_t_switch(
                 result.rdf_history,
                 result.temperatures,
+                volumes=result.volumes,
             )
         if result.t_decay is None and len(result.msd_values) >= 1:
             result.t_decay = detect_t_decay(

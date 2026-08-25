@@ -183,41 +183,100 @@ def compute_steinhardt_q4(atoms: Atoms, cutoff: float = 3.5) -> float:
 def detect_t_switch(
     rdf_history: Sequence[tuple[np.ndarray, np.ndarray]],
     temperatures: Sequence[float],
-    peak_shift_threshold: float = 0.15,
+    peak_shift_threshold: float = 0.30,
+    min_persistence: int = 3,
+    relative_volume_change: float | None = None,
+    volumes: Sequence[float] | None = None,
 ) -> float | None:
     """T_switch aus diskontinuierlichen RDF-Peak-Verschiebungen ableiten.
 
-    Vergleich aufeinanderfolgender RDF-Snapshots:  Wenn der erste signifikante
-    Peak um mehr als ``peak_shift_threshold`` Å wandert *oder* ein Peak
-    vollständig verschwindet, wird das als Strukturwechsel interpretiert.
+    Ein Phasenwechsel wird nur detektiert, wenn **alle** folgenden
+    Kriterien erfüllt sind:
+
+    1. Der erste signifikante RDF-Peak verschiebt sich um mehr als
+       ``peak_shift_threshold`` Å **sprunghaft** (nicht kontinuierlich).
+    2. Die Verschiebung ist **persistent**: sie bleibt für mindestens
+       ``min_persistence`` aufeinanderfolgende Schritte oberhalb des
+       Schwellwerts (verwirft transientes Rauschen).
+    3. Optional: Wenn ``volumes`` übergeben wird, muss auch eine
+       Volumenänderung > 5% um denselben Temperaturbereich auftreten.
 
     Returns
     -------
     float | None
         Temperatur des ersten detektierten Sprungs oder *None*.
     """
-    if len(rdf_history) < 2:
+    if len(rdf_history) < min_persistence + 1:
         return None
 
     prev_r, prev_g = rdf_history[0]
     prev_peaks, _ = find_peaks(prev_g, height=0.5, distance=5)
     prev_peak_pos = prev_r[prev_peaks] if prev_peaks.size else np.array([])
 
+    # Kontinuierliche Verschiebung tracken, um Sprünge von Ausdehnung zu trennen
+    prev_shift = 0.0  # kumulierte Verschiebung seit Schritt 0
+
     for idx in range(1, len(rdf_history)):
         r, g = rdf_history[idx]
         peaks, _ = find_peaks(g, height=0.5, distance=5)
         curr_peak_pos = r[peaks] if peaks.size else np.array([])
 
+        detected = False
+
         # Peak-Verschiebung
         if prev_peak_pos.size > 0 and curr_peak_pos.size > 0:
             n_min = min(prev_peak_pos.size, curr_peak_pos.size)
+            # Vergleiche ersten Peak (stabilster, NN-Abstand)
+            shift_first = abs(curr_peak_pos[0] - prev_peak_pos[0])
             shifts = np.abs(prev_peak_pos[:n_min] - curr_peak_pos[:n_min])
             max_shift = float(np.max(shifts)) if shifts.size else 0.0
-            if max_shift > peak_shift_threshold:
-                return float(temperatures[idx])
 
-        # Peak verschwunden
+            # Sprung vs. kontinuierliche Ausdehnung:
+            # Ein Phasenwechsel ist ein plötzlicher Sprung, nicht eine
+            # graduelle Verschiebung über viele Schritte.
+            # Wir verlangen: max_shift > threshold UND max_shift > 3× prev_shift
+            if max_shift > peak_shift_threshold and max_shift > 3.0 * max(prev_shift, 0.01):
+                detected = True
+
+            prev_shift = shift_first
+
+        # Peak verschwunden (nur wenn vorher signifikant)
         elif prev_peak_pos.size > 0 and curr_peak_pos.size == 0:
+            detected = True
+
+        if detected:
+            # Persistenz-Check: Verschiebung muss für min_persistence
+            # weitere Schritte bestehen bleiben
+            if idx + min_persistence <= len(rdf_history):
+                persistent = True
+                for k in range(idx + 1, min(idx + min_persistence, len(rdf_history))):
+                    r_k, g_k = rdf_history[k]
+                    pk_k, _ = find_peaks(g_k, height=0.5, distance=5)
+                    if pk_k.size == 0:
+                        persistent = False
+                        break
+                    pk_k_pos = r_k[pk_k]
+                    # Vergleiche mit dem Ursprung (Schritt 0)
+                    if prev_peak_pos.size > 0 and pk_k_pos.size > 0:
+                        n = min(prev_peak_pos.size, pk_k_pos.size)
+                        shift_k = np.abs(prev_peak_pos[:n] - pk_k_pos[:n])
+                        if float(np.max(shift_k)) < peak_shift_threshold:
+                            persistent = False
+                            break
+                if not persistent:
+                    prev_peak_pos = curr_peak_pos
+                    continue
+
+            # Optional: Volumenänderung bestätigen
+            if volumes is not None and len(volumes) == len(temperatures):
+                v_before = volumes[max(idx - 1, 0)]
+                v_after = volumes[min(idx, len(volumes) - 1)]
+                if v_before > 0:
+                    vol_change = abs(v_after - v_before) / v_before
+                    if vol_change < 0.02:  # < 2% Volumenänderung → kein Switch
+                        prev_peak_pos = curr_peak_pos
+                        continue
+
             return float(temperatures[idx])
 
         prev_peak_pos = curr_peak_pos

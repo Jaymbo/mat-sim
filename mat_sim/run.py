@@ -106,6 +106,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Auch Materialien ohne T_switch ins Ranking aufnehmen")
     p.add_argument("--recompute", action="store_true",
                    help="Optische Scores neu berechnen (auch bereits gespeicherte)")
+    p.add_argument("--recheck-switch", action="store_true",
+                   help="T_switch für alle Materialien mit gespeicherten RDFs neu auswerten (strengere Kriterien)")
     p.add_argument("--save", type=str, default=None,
                    help="Dateipfad für PNG-Export (Default: dashboard_<id>.png)")
     p.add_argument("--show", action="store_true",
@@ -254,6 +256,75 @@ def _run_reset_stale(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── Recheck-Switch ─────────────────────────────────────────────────────────
+
+def _run_recheck_switch(args: argparse.Namespace) -> int:
+    """T_switch für alle Materialien mit gespeicherten RDFs neu auswerten.
+
+    Nutzt die strengeren Kriterien (Persistenz-Check, Sprung vs. Ausdehnung,
+    Volumen-Bestätigung) auf der gespeicherten RDF-History.
+    """
+    from .storage import list_material_ids, load_result, update_t_switch
+    from .metrics import detect_t_switch
+
+    ids = list_material_ids(args.db)
+    if not ids:
+        print("Keine Materialien in der DB.")
+        return 0
+
+    n_total = len(ids)
+    n_old_switch = 0
+    n_new_switch = 0
+    n_lost_switch = 0
+    n_no_rdf = 0
+
+    print(f"Re-check T_switch für {n_total} Materialien …")
+
+    for i, mid in enumerate(ids, start=1):
+        mat = load_result(args.db, mid)
+        old_t = mat.t_switch
+
+        # RDF-History verfügbar?
+        if mat.rdf_history is None or len(mat.rdf_history) < 2:
+            n_no_rdf += 1
+            # Alte Materialien ohne rdf_history: T_switch zurücksetzen
+            # (kann nicht nachgeprüft werden)
+            if old_t is not None:
+                update_t_switch(args.db, mid, None)
+                n_lost_switch += 1
+            continue
+
+        # Neue Detektion mit strengeren Kriterien
+        new_t = detect_t_switch(
+            mat.rdf_history,
+            mat.temperatures,
+            volumes=mat.volumes,
+        )
+
+        if old_t is not None:
+            n_old_switch += 1
+        if new_t is not None:
+            n_new_switch += 1
+        if old_t is not None and new_t is None:
+            n_lost_switch += 1
+
+        # Nur updaten wenn sich geändert hat
+        if new_t != old_t:
+            update_t_switch(args.db, mid, new_t)
+
+        if i % 100 == 0:
+            print(f"  … {i}/{n_total} geprüft", flush=True)
+
+    print(f"\nErgebnis Re-check:")
+    print(f"  Total geprüft:      {n_total}")
+    print(f"  Alte T_switch:      {n_old_switch}")
+    print(f"  Neue T_switch:      {n_new_switch}")
+    print(f"  Verlorene Switches: {n_lost_switch} (false positives)")
+    print(f"  Ohne RDF-History:   {n_no_rdf}")
+    print(f"  → {n_old_switch - n_lost_switch} bleiben, {n_new_switch} gesamt")
+    return 0
+
+
 # ── Einstiegspunkt ──────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -270,6 +341,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_queue_stats(args)
     if args.reset_stale:
         return _run_reset_stale(args)
+    if args.recheck_switch:
+        return _run_recheck_switch(args)
     if args.ingest:
         return _run_ingest(args)
     return _run_pipeline(args)

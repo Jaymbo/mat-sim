@@ -77,6 +77,7 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
             energies        TEXT,
             structure_before_json TEXT,
             structure_after_json  TEXT,
+            rdf_history_json      TEXT,
             cooling_score   REAL,
             heating_score   REAL,
             total_score     REAL,
@@ -89,6 +90,7 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
     _migrate_columns(conn, "materials", {
         "structure_before_json": "TEXT",
         "structure_after_json": "TEXT",
+        "rdf_history_json": "TEXT",
         "cooling_score": "REAL",
         "heating_score": "REAL",
         "total_score": "REAL",
@@ -111,6 +113,21 @@ def _migrate_columns(conn: sqlite3.Connection, table: str, columns: dict[str, st
 def _rdf_to_json(rdf: tuple[np.ndarray, np.ndarray]) -> str:
     r, g = rdf
     return json.dumps({"r": r.tolist(), "g": g.tolist()})
+
+
+def _rdf_history_to_json(history: list[tuple[np.ndarray, np.ndarray]]) -> str:
+    """Vollständige RDF-History als JSON serialisieren."""
+    return json.dumps([
+        {"r": r.tolist(), "g": g.tolist()} for r, g in history
+    ])
+
+
+def _rdf_history_from_json(raw: str | None) -> list[tuple[np.ndarray, np.ndarray]] | None:
+    """JSON → Liste von (r, g)-Tupeln deserialisieren."""
+    if raw is None:
+        return None
+    obj = json.loads(raw)
+    return [(np.array(item["r"]), np.array(item["g"])) for item in obj]
 
 
 def _atoms_to_json(atoms) -> str:
@@ -190,14 +207,16 @@ def store_result(
             rdf_after = rdf_json
             atoms_after = atoms_json
 
+    rdf_history_json = _rdf_history_to_json(result.rdf_history) if result.rdf_history else None
+
     conn.execute(
         """
         INSERT OR REPLACE INTO materials
             (material_id, formula, status, t_switch, t_decay,
              rdf_before_json, rdf_after_json,
              temperatures, msd_values, ql_values, volumes, energies,
-             structure_before_json, structure_after_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             structure_before_json, structure_after_json, rdf_history_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             entry.material_id,
@@ -214,6 +233,7 @@ def store_result(
             json.dumps(result.energies),
             atoms_before,
             atoms_after,
+            rdf_history_json,
         ),
     )
     conn.commit()
@@ -280,6 +300,19 @@ def list_unevaluated_materials(db_path: str | Path, only_switching: bool = True)
     return [r[0] for r in rows]
 
 
+def update_t_switch(db_path: str | Path, material_id: str, t_switch: float | None) -> None:
+    """T_switch-Wert in der DB aktualisieren (für --recheck-switch)."""
+    conn = init_db(db_path)
+    try:
+        conn.execute(
+            "UPDATE materials SET t_switch = ? WHERE material_id = ?",
+            (t_switch, material_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def store_batch(
     db_path: str | Path,
     results: Sequence[tuple[MPEntry, TrajectoryResult, dict]],
@@ -313,6 +346,7 @@ class StoredMaterial:
     # Neue Felder (können None sein bei alten DB-Einträgen)
     structure_before: object | None = None  # ase.Atoms oder None
     structure_after: object | None = None
+    rdf_history: list | None = None  # list[tuple[np.ndarray, np.ndarray]] oder None
     cooling_score: float | None = None
     heating_score: float | None = None
     total_score: float | None = None
@@ -340,7 +374,7 @@ def load_result(db_path: str | Path, material_id: str) -> StoredMaterial:
             "SELECT material_id, formula, status, t_switch, t_decay, "
             "rdf_before_json, rdf_after_json, "
             "temperatures, msd_values, ql_values, volumes, energies, "
-            "structure_before_json, structure_after_json, "
+            "structure_before_json, structure_after_json, rdf_history_json, "
             "cooling_score, heating_score, total_score, optical_evaluated "
             "FROM materials WHERE material_id = ?",
             (material_id,),
@@ -366,10 +400,11 @@ def load_result(db_path: str | Path, material_id: str) -> StoredMaterial:
         energies=json.loads(row[11]) if row[11] else [],
         structure_before=_atoms_from_json(row[12]),
         structure_after=_atoms_from_json(row[13]),
-        cooling_score=row[14],
-        heating_score=row[15],
-        total_score=row[16],
-        optical_evaluated=row[17],
+        rdf_history=_rdf_history_from_json(row[14]),
+        cooling_score=row[15],
+        heating_score=row[16],
+        total_score=row[17],
+        optical_evaluated=row[18],
     )
 
 
