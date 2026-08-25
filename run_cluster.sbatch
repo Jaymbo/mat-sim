@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=mat_sim_screening
+#SBATCH --job-name=mat_sim_process
 #SBATCH --partition=gpu_a100_short,gpu_h100_short,gpu_h100,gpu_a100_il,gpu_h100_il,dev_gpu_h100,dev_gpu_a100_il
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -21,31 +21,35 @@ export OPENBLAS_NUM_THREADS=1
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate mat-sim
 
-# ── Pipeline starten ────────────────────────────────────────────────────────
-echo "[$(date)] Starte mat-sim Screening auf $(hostname)"
+# ── Worker: claimt pending-Strukturen aus DB, simuliert, wiederholt ─────────
+echo "[$(date)] Starte mat-sim Worker auf $(hostname)"
 echo "  SLURM Job ID:  $SLURM_JOB_ID"
 echo "  Partition:     $SLURM_JOB_PARTITION"
 echo "  GPU:           $CUDA_VISIBLE_DEVICES"
 echo ""
 
+# Stale-Einträge von abgestürzten Jobs zurücksetzen
+python -m mat_sim.run --reset-stale --db results.db
+
+# Queue-Statistik vor dem Start
+python -m mat_sim.run --queue-stats --db results.db
+
+# Verarbeitung: claimt pending-Strukturen aus der DB bis Time-Out oder leer
 python -m mat_sim.run \
-    --chemsys V-O Ti-O Cr-O Mn-O Sr-Ti-O \
-    --t-max 500 \
-    --delta-t 10 \
+    --db results.db \
     --device auto \
-    --duration-min 25
+    --duration-min 25 \
+    --t-max 500 \
+    --delta-t 10
 
 TRAIN_EXIT=$?
 
 echo ""
-echo "[$(date)] Pipeline beendet. Exit-Code: $TRAIN_EXIT"
+echo "[$(date)] Worker beendet. Exit-Code: $TRAIN_EXIT"
 
-# ── Auto-Rescheduling bei Time-Out (Exit 88) ────────────────────────────────
-if [ "$TRAIN_EXIT" -eq 88 ]; then
-    echo "[$(date)] Time-Out erkannt (Exit 88) – reiche neuen SLURM-Job ein …"
-    sbatch run_cluster.sbatch
-elif [ "$TRAIN_EXIT" -eq 0 ]; then
-    echo "[$(date)] Screening vollständig abgeschlossen. Kein Neustart nötig."
-else
-    echo "[$(date)] Unerwarteter Exit-Code ($TRAIN_EXIT) – kein Auto-Rescheduling."
-fi
+# Queue-Statistik nach Abschluss
+python -m mat_sim.run --queue-stats --db results.db
+
+# Exit-Code 88 = Time-Out (Dispatcher reicht ggf. neuen Job ein)
+# Exit-Code 0 = Queue leer
+exit $TRAIN_EXIT

@@ -1,4 +1,29 @@
+# ── Secrets & Environment ──
 .env
-results.db
-*__pycache__*
-dashboard*
+
+# ── Datenbanken ──
+*.db
+*.db-wal
+*.db-shm
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── Dashboards & generierte Plots ──
+dashboard_*.png
+
+# ── SLURM-Logs ──
+logs/
+
+# ── Editor / OS ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

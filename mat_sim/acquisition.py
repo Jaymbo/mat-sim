@@ -5,10 +5,19 @@ Kernfunktionen
 - ``query_mp_structures``  – Chemische Filter an MP, Rückgabe pymatgen-Strukturen
 - ``pmg_to_ase``           – Typsichere Konvertierung pymatgen.Structure → ase.Atoms
 - ``build_structure_batch`` – Komfort-Funktion: Query + Konvertierung in einem Aufruf
+
+Suchstrategie
+-------------
+- ``energy_above_hull`` bis 0.1 eV/Atom (inkl. metastabile Phasen)
+- GNoME / theoretische Strukturen explizit eingeschlossen (kein Filter
+  auf ``theoretical`` oder ``is_stable``)
+- Ternäre Erweiterung: Bei Eingabe von ``V-O`` werden zusätzlich alle
+  Verbindungen V-O-X gefunden, die ein drittes Element enthalten.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Iterable
@@ -18,7 +27,20 @@ from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from mp_api.client import MPRester
 
 from ase import Atoms
-from ase.build import bulk, niggli_reduce
+from ase.build import niggli_reduce
+
+logger = logging.getLogger(__name__)
+
+# Alle Elemente, die als drittes Dotierungs-Element in Frage kommen
+# (kompakt — ohne Edelgase, ohne rein radioaktive)
+_ALL_ELEMENTS: list[str] = [
+    "H", "Li", "Be", "B", "C", "N", "O", "F", "Na", "Mg", "Al", "Si", "P", "S",
+    "Cl", "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Ga", "Ge", "As", "Se", "Br", "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru",
+    "Rh", "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Cs", "Ba", "La", "Ce",
+    "Pr", "Nd", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf",
+    "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi",
+]
 
 
 # ── Hilfs-Datentyp ──────────────────────────────────────────────────────────
@@ -35,23 +57,28 @@ class MPEntry:
 def query_mp_structures(
     chemsys: str,
     api_key: str | None = None,
-    max_results: int = 50,
-    stable_only: bool = True,
+    max_results: int = 2000,
+    e_hull_max: float = 0.1,
+    include_ternary: bool = True,
 ) -> list[MPEntry]:
     """Strukturen aus dem Materials Project abfragen.
 
-    Parameters
-    ----------
+    Parameter
+    ---------
     chemsys
         Chemisches System, z. B. ``"V-O"``, ``"Ti-O"``, ``"Sr-Ti-O"``.
     api_key
         Materials-Project-API-Key.  Wenn *None*, wird die Umgebungsvariable
         ``MP_API_KEY`` verwendet.
     max_results
-        Maximale Anzahl zurückgegebener Einträge.
-    stable_only
-        Wenn *True*, werden nur thermodynamisch stabile Phasen (energy_above_hull ≈ 0)
-        abgefragt.
+        Maximale Anzahl zurückgegebener Einträge (Default 2000).
+    e_hull_max
+        Maximal zulässige Energie über der Hull in eV/Atom (Default 0.1).
+        ``0.0`` = nur stabile Phasen; ``0.1`` = inkl. metastabile Phasen.
+    include_ternary
+        Wenn *True* (Default), werden bei binären Systemen wie ``"V-O"``
+        zusätzlich ternäre Verbindungen ``V-O-X`` gesucht (drittes Element
+        als Dotierung).
 
     Returns
     -------
@@ -60,7 +87,6 @@ def query_mp_structures(
     """
     api_key = api_key or os.environ.get("MP_API_KEY")
     if not api_key:
-        # Fallback: .env laden, falls run.py nicht der Einstiegspunkt war
         from dotenv import load_dotenv
         load_dotenv()
         api_key = os.environ.get("MP_API_KEY")
@@ -70,29 +96,70 @@ def query_mp_structures(
             "oder übergebe api_key explizit."
         )
 
-    criteria: dict[str, object] = {
-        "chemsys": chemsys,
-    }
-    if stable_only:
-        criteria["energy_above_hull"] = (0, 0)  # nur stabile Phasen
-
+    elements = chemsys.split("-")
     fields = ["material_id", "formula_pretty", "structure"]
 
+    # ── 1. Exakte chemsys-Abfrage (binär oder ternär) ──────────────────
+    all_docs: list = []
+    seen_ids: set[str] = set()
+
     with MPRester(api_key) as rester:
+        # Exaktes chemsys
+        logger.info(
+            "MP-Query: chemsys=%s, e_hull ≤ %.3f eV/atom, max=%d",
+            chemsys, e_hull_max, max_results,
+        )
         docs = rester.materials.summary.search(
-            **criteria,
+            chemsys=chemsys,
+            energy_above_hull=(0, e_hull_max),
             fields=fields,
             num_sites=(2, 50),
+            num_elements=(len(elements), len(elements)),
         )
+        for doc in docs:
+            if doc.material_id not in seen_ids:
+                all_docs.append(doc)
+                seen_ids.add(doc.material_id)
+
+        # ── 2. Ternäre Erweiterung bei binären Systemen ────────────────
+        if include_ternary and len(elements) == 2:
+            el_a, el_b = elements
+            logger.info(
+                "Ternäre Erweiterung: suche %s-%s-X für alle Elemente X …",
+                el_a, el_b,
+            )
+            for el_x in _ALL_ELEMENTS:
+                if el_x in (el_a, el_b):
+                    continue
+                ternary_chemsys = "-".join(sorted([el_a, el_b, el_x]))
+                try:
+                    docs = rester.materials.summary.search(
+                        chemsys=ternary_chemsys,
+                        energy_above_hull=(0, e_hull_max),
+                        fields=fields,
+                        num_sites=(2, 50),
+                        num_elements=(3, 3),
+                    )
+                    for doc in docs:
+                        if doc.material_id not in seen_ids:
+                            all_docs.append(doc)
+                            seen_ids.add(doc.material_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Ternary %s fehlgeschlagen: %s", ternary_chemsys, exc)
+
+    logger.info(
+        "Query beendet: %d eindeutige Strukturen für %s",
+        len(all_docs), chemsys,
+    )
 
     entries: list[MPEntry] = []
-    for doc in docs[:max_results]:
+    for doc in all_docs[:max_results]:
         struct: Structure = doc.structure
         # Primitive Standard-Zelle für effizientere MD
         try:
             spa = SpacegroupAnalyzer(struct)
             struct = spa.get_primitive_standard_structure()
-        except Exception:  # noqa: BLE001 – Symmetrie-Erkennung kann scheitern
+        except Exception:  # noqa: BLE001
             pass
         entries.append(
             MPEntry(
@@ -136,8 +203,9 @@ def pmg_to_ase(structure: Structure) -> Atoms:
 def build_structure_batch(
     chemsys: str | Iterable[str],
     api_key: str | None = None,
-    max_results_per_sys: int = 50,
-    stable_only: bool = True,
+    max_results_per_sys: int = 2000,
+    e_hull_max: float = 0.1,
+    include_ternary: bool = True,
 ) -> list[tuple[MPEntry, Atoms]]:
     """MP-Query + ASE-Konvertierung für ein oder mehrere chemische Systeme.
 
@@ -155,7 +223,8 @@ def build_structure_batch(
                 chemsys=sys,
                 api_key=api_key,
                 max_results=max_results_per_sys,
-                stable_only=stable_only,
+                e_hull_max=e_hull_max,
+                include_ternary=include_ternary,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] Query für {sys!r} fehlgeschlagen: {exc}")

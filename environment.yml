@@ -7,7 +7,7 @@ channels:
 dependencies:
   - python=3.11
   - numpy
-  - scipy
+  - scipy>=1.12
   - matplotlib
   - sqlite
   - pip
@@ -18,3 +18,4 @@ dependencies:
       - mace-torch
       - chgnet
       - python-dotenv
+      - PyMieScatt

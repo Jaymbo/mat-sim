@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 """Kommandozeile-Einstiegspunkt für die mat-sim Pipeline.
 
-Beispiele
----------
-Pipeline starten:
-    export MP_API_KEY="dein_key"
-    python -m mat_sim.run --chemsys V-O Ti-O Sr-Ti-O --t-max 600 --delta-t 10
+Zwei-Phasen-Workflow
+---------------------
+1. **Ingest** (einmalig):  Strukturen von MP herunterladen → DB.
+   Beispiele:
+    python -m mat_sim.run --ingest --chemsys V-O Ti-O Cr-O --db results.db
+
+2. **Process** (wiederholt, parallel):  pending-Strukturen aus DB simulieren.
+   Beispiele:
+    python -m mat_sim.run --db results.db --device auto --duration-min 25
+
+Allgemeine Beispiele
+---------------------
+Pipeline starten (Ingest + Process in einem Schritt):
+    python -m mat_sim.run --chemsys V-O Ti-O --t-max 600 --delta-t 10
 
 Einzelnes Material analysieren (Dashboard + Vor-Evaluierung):
     python -m mat_sim.run --analyze --material-id mp-1234 --db results.db
@@ -13,16 +22,26 @@ Einzelnes Material analysieren (Dashboard + Vor-Evaluierung):
 Alle Materialien der DB analysieren:
     python -m mat_sim.run --analyze --all --db results.db
 
-Optionen (Pipeline)
-    --chemsys        Ein oder mehrere chemische Systeme (Leerzeichen-getrennt)
-    --mlip           mace | chgnet  (Default: mace)
-    --device         cpu | cuda | auto  (Default: cpu)
-    --t-max          Maximaltemperatur in K          (Default: 600)
-    --delta-t        Temperaturschritt in K          (Default: 10)
-    --therm-steps    Thermalisierungs-Schritte pro T (Default: 100)
-    --max-results    Max. Strukturen pro System       (Default: 50)
-    --duration-min   Max. Laufzeit in Minuten (SLURM) (Default: 25)
-    --db             Pfad zur SQLite-DB              (Default: results.db)
+Queue-Statistik anzeigen:
+    python -m mat_sim.run --queue-stats --db results.db
+
+Stale processing-Einträge zurücksetzen:
+    python -m mat_sim.run --reset-stale --db results.db
+
+Optionen (Ingest)
+    --ingest          Nur Ingest: Strukturen herunterladen, nicht simulieren
+    --chemsys         Ein oder mehrere chemische Systeme
+    --include-ternary Ternäre Erweiterung (Default: true)
+    --max-results     Max. Strukturen pro System       (Default: 2000)
+    --e-hull-max      Max. energy_above_hull eV/atom   (Default: 0.1)
+
+Optionen (Process)
+    --device          cpu | cuda | auto  (Default: cpu)
+    --t-max           Maximaltemperatur in K          (Default: 600)
+    --delta-t         Temperaturschritt in K          (Default: 10)
+    --therm-steps     Thermalisierungs-Schritte pro T (Default: 100)
+    --duration-min    Max. Laufzeit in Minuten (SLURM) (Default: 25)
+    --stale-minutes   processing-Timeout für Reset    (Default: 30)
 
 Optionen (Analyse)
     --analyze        Aktiviert den Analyse-Modus
@@ -52,7 +71,7 @@ if not torch.cuda.is_available():
     torch.set_num_interop_threads(4)
 
 from .md import RampConfig
-from .pipeline import PipelineConfig, run_pipeline
+from .pipeline import PipelineConfig, run_pipeline, ingest_phase
 
 
 # ── Argument-Parser ─────────────────────────────────────────────────────────
@@ -78,18 +97,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--show", action="store_true",
                    help="Interaktives Matplotlib-Fenster öffnen")
 
-    # ── Pipeline-Optionen ──
+    # ── Ingest-Modus ──
+    p.add_argument("--ingest", action="store_true",
+                   help="Nur Ingest: Strukturen von MP herunterladen → DB (keine Simulation)")
     p.add_argument("--chemsys", nargs="+", default=None,
                    help="Chemische Systeme, z. B. V-O Ti-O Sr-Ti-O")
+    p.add_argument("--include-ternary", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Ternäre Erweiterung bei binären Systemen (Default: True)")
+    p.add_argument("--max-results", type=int, default=2000)
+    p.add_argument("--e-hull-max", type=float, default=0.1,
+                   help="Max. energy_above_hull in eV/atom (0.0 = nur stabil, 0.1 = inkl. metastabil)")
+
+    # ── Process-Modus ──
     p.add_argument("--mlip", choices=["mace", "chgnet"], default="mace")
     p.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
     p.add_argument("--t-max", type=float, default=600.0)
     p.add_argument("--delta-t", type=float, default=10.0)
     p.add_argument("--therm-steps", type=int, default=100)
-    p.add_argument("--max-results", type=int, default=50)
-    p.add_argument("--stable-only", action="store_true", default=True)
     p.add_argument("--duration-min", type=int, default=25,
                    help="Max. Laufzeit in Minuten (SLURM Time-Out-Handling, Default: 25)")
+    p.add_argument("--stale-minutes", type=int, default=30,
+                   help="processing-Einträge älter als N Min. → reset auf pending (Default: 30)")
+
+    # ── Queue-Management ──
+    p.add_argument("--queue-stats", action="store_true",
+                   help="Queue-Statistik anzeigen und beenden")
+    p.add_argument("--reset-stale", action="store_true",
+                   help="Stale 'processing'-Einträge zurück auf 'pending' setzen")
 
     return p.parse_args(argv)
 
@@ -124,12 +159,38 @@ def _run_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
-# ── Pipeline-Modus ──────────────────────────────────────────────────────────
+# ── Ingest-Modus ────────────────────────────────────────────────────────────
+
+def _run_ingest(args: argparse.Namespace) -> int:
+    if not args.chemsys:
+        print("[FEHLER] Ingest-Modus benötigt --chemsys (z. B. --chemsys V-O Ti-O).")
+        return 1
+
+    cfg = PipelineConfig(
+        chemsys_list=args.chemsys,
+        max_results_per_sys=args.max_results,
+        e_hull_max=args.e_hull_max,
+        include_ternary=args.include_ternary,
+        db_path=args.db,
+    )
+    ingest_phase(cfg)
+    return 0
+
+
+# ── Pipeline-Modus (Process) ────────────────────────────────────────────────
 
 def _run_pipeline(args: argparse.Namespace) -> int:
-    if not args.chemsys:
-        print("[FEHLER] Pipeline-Modus benötigt --chemsys (z. B. --chemsys V-O Ti-O).")
-        return 1
+    # Wenn --chemsys angegeben ist UND nicht --ingest: Ingest + Process in einem
+    if args.chemsys and not args.chemsys == []:
+        # Erst Ingest, dann Process
+        cfg_ingest = PipelineConfig(
+            chemsys_list=args.chemsys,
+            max_results_per_sys=args.max_results,
+            e_hull_max=args.e_hull_max,
+            include_ternary=args.include_ternary,
+            db_path=args.db,
+        )
+        ingest_phase(cfg_ingest)
 
     ramp = RampConfig(
         t_max=args.t_max,
@@ -137,16 +198,36 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         thermalization_steps=args.therm_steps,
     )
     cfg = PipelineConfig(
-        chemsys_list=args.chemsys,
+        chemsys_list=args.chemsys or [],
         mlip_backend=args.mlip,
         device=args.device,
-        max_results_per_sys=args.max_results,
-        stable_only=args.stable_only,
         ramp=ramp,
         db_path=args.db,
         duration_min=args.duration_min,
+        stale_minutes=args.stale_minutes,
     )
     return run_pipeline(cfg)
+
+
+# ── Queue-Management ────────────────────────────────────────────────────────
+
+def _run_queue_stats(args: argparse.Namespace) -> int:
+    from .storage import queue_stats
+    stats = queue_stats(args.db)
+    print(f"Queue-Statistik ({args.db}):")
+    print(f"  pending:    {stats['pending']:>6}")
+    print(f"  processing: {stats['processing']:>6}")
+    print(f"  done:       {stats['done']:>6}")
+    print(f"  error:      {stats['error']:>6}")
+    print(f"  total:      {stats['total']:>6}")
+    return 0
+
+
+def _run_reset_stale(args: argparse.Namespace) -> int:
+    from .storage import reset_stale
+    n = reset_stale(args.db, stale_minutes=args.stale_minutes)
+    print(f"{n} stale 'processing'-Einträge zurück auf 'pending' gesetzt.")
+    return 0
 
 
 # ── Einstiegspunkt ──────────────────────────────────────────────────────────
@@ -161,6 +242,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.analyze:
         return _run_analyze(args)
+    if args.queue_stats:
+        return _run_queue_stats(args)
+    if args.reset_stale:
+        return _run_reset_stale(args)
+    if args.ingest:
+        return _run_ingest(args)
     return _run_pipeline(args)
 
 

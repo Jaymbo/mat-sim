@@ -1,14 +1,30 @@
 """Persistierung der Ergebnisse in einer SQLite-Datenbank.
 
-Tabelle ``materials`` speichert pro Kristall:
-  material_id, formula, t_switch, t_decay, rdf_before (JSON), rdf_after (JSON),
-  temperature_ramp (JSON), msd_curve (JSON)
+Tabellen
+--------
+``structures`` – Warteschlange (Queue) der heruntergeladenen Strukturen:
+    material_id, formula, chemsys, structure_json, status, claimed_by, ...
+    Status: 'pending' → 'processing' → 'done' / 'error'
+
+``materials`` – Ergebnisse der MD-Simulationen:
+    material_id, formula, t_switch, t_decay, rdf_before (JSON), rdf_after (JSON),
+    temperature_ramp (JSON), msd_curve (JSON)
+
+Workflow
+--------
+1. **Ingest**: ``ingest_structures()`` lädt Strukturen von MP → ``structures``
+   (status='pending').  Einmal pro chemisches System.
+2. **Process**: ``claim_next_structure()`` holt atomar die nächste pending-
+   Struktur (status → 'processing').  Nach Simulation → 'done'.
+3. **Recovery**: ``reset_stale()`` setzt abgestürzte 'processing'-Einträge
+   nach Timeout zurück auf 'pending'.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -20,10 +36,28 @@ from .metrics import TrajectoryResult
 
 
 def init_db(db_path: str | Path) -> sqlite3.Connection:
-    """Datenbank initialisieren (Tabelle anlegen, falls nicht vorhanden)."""
+    """Datenbank initialisieren (Tabellen anlegen, falls nicht vorhanden)."""
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")  # bessere Parallelität
+    conn.execute("PRAGMA busy_timeout=30000")  # 30 s auf Lock warten
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS structures (
+            material_id     TEXT PRIMARY KEY,
+            formula         TEXT NOT NULL,
+            chemsys         TEXT NOT NULL,
+            structure_json  TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            claimed_by      TEXT,
+            claimed_at      TIMESTAMP,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_structures_status
+        ON structures(status)
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS materials (
             material_id     TEXT PRIMARY KEY,
@@ -173,3 +207,203 @@ def list_material_ids(db_path: str | Path) -> list[str]:
     finally:
         conn.close()
     return [r[0] for r in rows]
+
+
+# ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══
+#  STRUCTURES QUEUE
+# ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══
+
+
+@dataclass
+class QueuedStructure:
+    """Ein Eintrag aus der structures-Queue."""
+
+    material_id: str
+    formula: str
+    chemsys: str
+    structure_json: str
+
+
+def _structure_to_json(structure) -> str:
+    """pymatgen.Structure → JSON-String serialisieren."""
+    from pymatgen.core import Structure
+
+    if isinstance(structure, Structure):
+        return structure.to_json()
+    # Fallback: bereits JSON-String oder dict
+    if isinstance(structure, str):
+        return structure
+    return json.dumps(structure)
+
+
+def _structure_from_json(raw: str):
+    """JSON-String → pymatgen.Structure deserialisieren."""
+    from pymatgen.core import Structure
+
+    return Structure.from_str(raw, fmt="json")
+
+
+def ingest_structures(
+    db_path: str | Path,
+    entries: list[MPEntry],
+    chemsys: str,
+) -> int:
+    """Strukturen in die Queue-Tabelle einfügen (Idempotent, Insert-or-Ignore).
+
+    Returns
+    -------
+    int
+        Anzahl tatsächlich neu eingefügter Strukturen.
+    """
+    conn = init_db(db_path)
+    inserted = 0
+    try:
+        for entry in entries:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO structures
+                    (material_id, formula, chemsys, structure_json, status)
+                VALUES (?, ?, ?, ?, 'pending')
+                """,
+                (
+                    entry.material_id,
+                    entry.formula_pretty,
+                    chemsys,
+                    _structure_to_json(entry.structure),
+                ),
+            )
+            inserted += cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return inserted
+
+
+def claim_next_structure(
+    db_path: str | Path,
+    worker_id: str,
+) -> QueuedStructure | None:
+    """Atomar die nächste pending-Struktur claimen (status → 'processing').
+
+    Verwendet eine SQLite-Transaktion, um sicherzustellen, dass keine zwei
+    Worker dieselbe Struktur bekommen.
+
+    Returns
+    -------
+    QueuedStructure | None
+        Die geclaimte Struktur oder *None*, wenn keine pending mehr vorhanden.
+    """
+    conn = init_db(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT material_id, formula, chemsys, structure_json
+            FROM structures
+            WHERE status = 'pending'
+            ORDER BY material_id
+            LIMIT 1
+            """
+        ).fetchone()
+
+        if row is None:
+            conn.execute("ROLLBACK")
+            return None
+
+        material_id = row[0]
+        conn.execute(
+            """
+            UPDATE structures
+            SET status = 'processing', claimed_by = ?, claimed_at = ?
+            WHERE material_id = ? AND status = 'pending'
+            """,
+            (worker_id, time.strftime("%Y-%m-%d %H:%M:%S"), material_id),
+        )
+        conn.execute("COMMIT")
+        return QueuedStructure(
+            material_id=row[0],
+            formula=row[1],
+            chemsys=row[2],
+            structure_json=row[3],
+        )
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def mark_structure_done(db_path: str | Path, material_id: str) -> None:
+    """Struktur nach erfolgreicher Simulation als 'done' markieren."""
+    conn = init_db(db_path)
+    try:
+        conn.execute(
+            "UPDATE structures SET status = 'done' WHERE material_id = ?",
+            (material_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_structure_error(db_path: str | Path, material_id: str) -> None:
+    """Struktur nach fehlgeschlagener Simulation als 'error' markieren."""
+    conn = init_db(db_path)
+    try:
+        conn.execute(
+            "UPDATE structures SET status = 'error' WHERE material_id = ?",
+            (material_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reset_stale(
+    db_path: str | Path,
+    stale_minutes: int = 30,
+) -> int:
+    """'processing'-Einträge, die zu lange laufen, zurück auf 'pending' setzen.
+
+    Returns
+    -------
+    int
+        Anzahl zurückgesetzter Einträge.
+    """
+    conn = init_db(db_path)
+    try:
+        cur = conn.execute(
+            """
+            UPDATE structures
+            SET status = 'pending', claimed_by = NULL, claimed_at = NULL
+            WHERE status = 'processing'
+              AND claimed_at IS NOT NULL
+              AND (
+                CAST(strftime('%s', 'now') AS INTEGER)
+                - CAST(strftime('%s', claimed_at) AS INTEGER)
+              ) > ?
+            """,
+            (stale_minutes * 60,),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def queue_stats(db_path: str | Path) -> dict[str, int]:
+    """Queue-Statistiken zurückgeben: counts per status."""
+    conn = init_db(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM structures GROUP BY status"
+        ).fetchall()
+    finally:
+        conn.close()
+    stats = {r[0]: r[1] for r in rows}
+    stats.setdefault("pending", 0)
+    stats.setdefault("processing", 0)
+    stats.setdefault("done", 0)
+    stats.setdefault("error", 0)
+    stats["total"] = sum(stats[s] for s in ("pending", "processing", "done", "error"))
+    return stats

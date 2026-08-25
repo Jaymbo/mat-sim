@@ -1,0 +1,10 @@
+pymatgen
+mp-api
+ase
+mace-torch
+chgnet
+scipy>=1.12
+numpy
+matplotlib
+python-dotenv
+PyMieScatt

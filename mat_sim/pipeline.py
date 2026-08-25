@@ -2,6 +2,18 @@
 
 Verbindet Akquisition → Calculator → MD-Rampe → Metriken → Speicherung.
 
+Zwei-Phasen-Workflow
+---------------------
+1. **Ingest** (``ingest_structures``):  Einmalig Strukturen von Materials
+   Project herunterladen und in der SQLite-DB (Tabelle ``structures``)
+   speichern.  Status='pending'.
+2. **Process** (``run_pipeline``):  Calculator initialisieren, dann in einer
+   Schleife atomar die nächste pending-Struktur aus der DB claimen,
+   simulieren, Ergebnis speichern, als 'done' markieren.
+
+   Mehrere Worker (SLURM-Jobs) können parallel laufen: Jeder claimt
+   exklusiv eine Struktur dank SQLite-Transaktionen.
+
 SLURM Time-Out-Handling:
   Die Pipeline überwacht die verstrichene Laufzeit.  Sobald die
   konfigurierte Dauer (``duration_min``) minus 2 Minuten Puffer
@@ -13,6 +25,8 @@ SLURM Time-Out-Handling:
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import time
 from dataclasses import dataclass
 from typing import Literal
@@ -20,11 +34,21 @@ from typing import Literal
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 
-from .acquisition import MPEntry, build_structure_batch
+from .acquisition import MPEntry, query_mp_structures, pmg_to_ase
 from .calculator import get_calculator
 from .md import ThermalRamp, RampConfig
 from .metrics import TrajectoryResult
-from .storage import init_db, store_result
+from .storage import (
+    init_db,
+    store_result,
+    ingest_structures,
+    claim_next_structure,
+    mark_structure_done,
+    mark_structure_error,
+    reset_stale,
+    queue_stats,
+    _structure_from_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,26 +62,83 @@ class PipelineConfig:
 
     chemsys_list: list[str]
     api_key: str | None = None
-    max_results_per_sys: int = 50
-    stable_only: bool = True
+    max_results_per_sys: int = 2000
+    e_hull_max: float = 0.1  # eV/atom — inkl. metastabile Phasen
+    include_ternary: bool = True
     mlip_backend: Literal["mace", "chgnet"] = "mace"
     device: str = "cpu"
     ramp: RampConfig = None  # type: ignore[assignment]  # → Default in __post_init__
     db_path: str = "results.db"
     duration_min: int = 25  # SLURM Time-Out in Minuten
+    stale_minutes: int = 30  # processing-Einträge älter als → reset
 
     def __post_init__(self) -> None:
         if self.ramp is None:
             self.ramp = RampConfig()
 
 
-def run_pipeline(cfg: PipelineConfig) -> int:
-    """Komplette Pipeline ausführen.
+# ── Phase 1: Ingest ─────────────────────────────────────────────────────────
+
+def ingest_phase(cfg: PipelineConfig) -> int:
+    """Strukturen von Materials Project herunterladen und in DB speichern.
+
+    Idempotent: Bereits vorhandene material_ids werden übersprungen.
 
     Returns
     -------
     int
-        Exit-Code: ``0`` bei vollständigem Durchlauf, ``88`` bei Time-Out.
+        Gesamtzahl neu eingefügter Strukturen.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    total_inserted = 0
+    for chemsys in cfg.chemsys_list:
+        logger.info("=== Ingest: %s ===", chemsys)
+        entries = query_mp_structures(
+            chemsys=chemsys,
+            api_key=cfg.api_key,
+            max_results=cfg.max_results_per_sys,
+            e_hull_max=cfg.e_hull_max,
+            include_ternary=cfg.include_ternary,
+        )
+        inserted = ingest_structures(cfg.db_path, entries, chemsys)
+        total_inserted += inserted
+        logger.info(
+            "%s: %d neu eingefügt (%d total in Queue)",
+            chemsys,
+            inserted,
+            queue_stats(cfg.db_path)["total"],
+        )
+
+    stats = queue_stats(cfg.db_path)
+    logger.info(
+        "Ingest beendet. Queue: %d pending, %d total",
+        stats["pending"],
+        stats["total"],
+    )
+    print(
+        f"[INGEST] {total_inserted} Strukturen neu eingefügt. "
+        f"Queue: {stats['pending']} pending, {stats['total']} total.",
+        flush=True,
+    )
+    return total_inserted
+
+
+# ── Phase 2: Process ────────────────────────────────────────────────────────
+
+def run_pipeline(cfg: PipelineConfig) -> int:
+    """MD-Simulationen für alle pending-Strukturen in der DB ausführen.
+
+    Die Schleife claimt atomar eine Struktur, simuliert sie, speichert das
+    Ergebnis und markiert sie als 'done'.  Bei Time-Out → Exit 88.
+
+    Returns
+    -------
+    int
+        Exit-Code: ``0`` wenn keine pending mehr, ``88`` bei Time-Out.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -66,56 +147,90 @@ def run_pipeline(cfg: PipelineConfig) -> int:
 
     t_start = time.perf_counter()
     max_runtime_s = cfg.duration_min * 60
+    worker_id = f"{socket.gethostname()}-{os.getpid()}"
 
     def _time_remaining() -> float:
         return max_runtime_s - (time.perf_counter() - t_start)
 
-    # 1 – Akquisition
-    logger.info("=== Schritt 1: Datenakquisition ===")
-    batch = build_structure_batch(
-        chemsys=cfg.chemsys_list,
-        api_key=cfg.api_key,
-        max_results_per_sys=cfg.max_results_per_sys,
-        stable_only=cfg.stable_only,
-    )
-    logger.info("%d Strukturen geladen.", len(batch))
+    # Stale-Reset: abgestürzte Jobs von vorherigen Läufen freigeben
+    n_reset = reset_stale(cfg.db_path, stale_minutes=cfg.stale_minutes)
+    if n_reset:
+        logger.info("Reset: %d stale 'processing'-Einträge → pending", n_reset)
 
-    # 2 – Calculator
-    logger.info("=== Schritt 2: Calculator initialisieren (%s) ===", cfg.mlip_backend)
+    # Calculator initialisieren (einmalig pro Job)
+    logger.info("=== Calculator initialisieren (%s, device=%s) ===",
+                cfg.mlip_backend, cfg.device)
     calc = get_calculator(backend=cfg.mlip_backend, device=cfg.device)
 
-    # 3 – DB
+    # DB-Verbindung für Ergebnisse
     conn = init_db(cfg.db_path)
 
-    # 4 – MD-Rampen
-    logger.info("=== Schritt 3: MD-Rampen (Time-Out nach %d min) ===", cfg.duration_min)
+    processed = 0
     timed_out = False
 
-    for idx, (entry, atoms) in enumerate(batch, start=1):
-        # Time-Out-Prüfung VOR dem Start eines neuen Materials
+    while True:
+        # Time-Out-Prüfung
         if _time_remaining() < _TIMEOUT_BUFFER_S:
             logger.warning(
-                "Time-Out: nur noch %.0f s bis zum Limit (%d min). "
-                "Breche vor Material %d/%d ab.",
+                "Time-Out: nur noch %.0f s bis zum Limit (%d min).",
                 _time_remaining(),
                 cfg.duration_min,
-                idx,
-                len(batch),
             )
             timed_out = True
             break
 
+        # Nächste Struktur claimen
+        queued = claim_next_structure(cfg.db_path, worker_id)
+        if queued is None:
+            logger.info("Keine pending-Strukturen mehr — Pipeline fertig.")
+            break
+
         logger.info(
-            "[%d/%d] %s (%s) — verbleibend: %.1f min",
-            idx,
-            len(batch),
-            entry.material_id,
-            entry.formula_pretty,
+            "[%d] %s (%s) — verbleibend: %.1f min",
+            processed + 1,
+            queued.material_id,
+            queued.formula,
             _time_remaining() / 60.0,
         )
+
+        # Struktur deserialisieren → ASE-Atoms
+        try:
+            structure = _structure_from_json(queued.structure_json)
+            entry = MPEntry(
+                material_id=queued.material_id,
+                formula_pretty=queued.formula,
+                structure=structure,
+            )
+            atoms = pmg_to_ase(structure)
+        except Exception as exc:
+            logger.error("Deserialisierung/Conversion %s fehlgeschlagen: %s",
+                         queued.material_id, exc)
+            mark_structure_error(cfg.db_path, queued.material_id)
+            continue
+
+        # MD-Simulation
         _process_single(entry, atoms, calc, cfg.ramp, conn)
+        mark_structure_done(cfg.db_path, queued.material_id)
+        processed += 1
+
+        stats = queue_stats(cfg.db_path)
+        logger.info(
+            "%s done. Queue: %d pending, %d done, %d error",
+            queued.material_id,
+            stats["pending"],
+            stats["done"],
+            stats["error"],
+        )
 
     conn.close()
+
+    stats = queue_stats(cfg.db_path)
+    print(
+        f"[PIPELINE] {processed} Strukturen simuliert. "
+        f"Queue: {stats['pending']} pending, {stats['done']} done, "
+        f"{stats['error']} error, {stats['total']} total.",
+        flush=True,
+    )
 
     if timed_out:
         logger.warning("=== Pipeline durch Time-Out abgebrochen (Exit 88) ===")
