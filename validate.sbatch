@@ -58,7 +58,7 @@ uv run python -m mat_sim.run \
     --device auto \
     --duration-min 25 \
     --t-max 1200 \
-    --delta-t 10 \
+    --delta-t 20 \
     --therm-steps 500
 
 SIM_EXIT=$?
