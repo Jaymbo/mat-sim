@@ -116,7 +116,7 @@ class RampConfig:
 
     t_start: float = 0.0            # K
     t_max: float = 1200.0           # K  (erhöht: deckt Übergänge bis ~1000 K ab)
-    delta_t: float = 10.0           # K pro Schritt
+    delta_t: float = 20.0           # K pro Schritt (20K → halbe Schrittzahl, 10K für feine Auflösung)
     thermalization_steps: int = 500     # Zeitschritte pro T-Stufe (500 fs bei 1 fs/Step)
     time_step: float = 1.0          # fs  (Standard für Oxid-MD)
     pressure: float = 1.0e-4        # GPa (≈ 1 atm)
@@ -127,6 +127,7 @@ class RampConfig:
     rdf_r_max: float = 6.0
     rdf_n_bins: int = 100
     log_interval: int = 50
+    checkpoint_interval: int = 5    # alle N Temperaturschritte einen Checkpoint speichern
     # Geometrieoptimierung
     fmax: float = 0.05              # eV/Å – Schwellwert für BFGS
     opt_max_steps: int = 200        # Max. Optimierungs-Schritte
@@ -295,8 +296,9 @@ class ThermalRamp:
             print(f"   [ERFOLG] T = {T:.1f} K nach {elapsed:.2f} Sekunden beendet. "
                   f"(MSD: {metrics.msd:.4f})", flush=True)
 
-            # ── Checkpoint nach jedem Schritt ────────────────────────────
-            if checkpoint_cb is not None:
+            # ── Checkpoint nur alle N Schritte (und immer vor Abbruch) ───
+            is_interval_step = global_step % cfg.checkpoint_interval == 0
+            if checkpoint_cb is not None and is_interval_step:
                 checkpoint_cb(global_step, T, result)
 
             # ── Deadline-Check: sauber abbrechen nach vollem Schritt ─────
@@ -305,6 +307,9 @@ class ThermalRamp:
                     "Deadline erreicht nach T=%.1f K (Schritt %d) — breche ab.",
                     T, global_step,
                 )
+                # Finaler Checkpoint vor Abbruch (auch wenn nicht Intervall-Schritt)
+                if checkpoint_cb is not None and not is_interval_step:
+                    checkpoint_cb(global_step, T, result)
                 result.status = "timed_out"
                 timed_out = True
                 break
@@ -316,6 +321,9 @@ class ThermalRamp:
             ):
                 result.t_decay = T
                 result.status = "decayed"
+                # Finaler Checkpoint vor Abbruch
+                if checkpoint_cb is not None and not is_interval_step:
+                    checkpoint_cb(global_step, T, result)
                 logger.warning("Zerfall detektiert bei T=%.1f K – Abbruch.", T)
                 print(f"   [WARNUNG] Zerfall detektiert bei T = {T:.1f} K – Abbruch.",
                       flush=True)

@@ -143,36 +143,44 @@ def compute_steinhardt_q4(atoms: Atoms, cutoff: float = 3.5) -> float:
     Ein *großer* Sprung zwischen aufeinanderfolgenden Schritten signalisiert
     einen Symmetrie-Wechsel → Phasentransformation.
 
-    Hinweis:  Für produktiven Einsatz kann Q6 etc. ergänzt werden;
-    Q4 reicht als Indikator für Oxid-Strukturen meist aus.
+    Vektorisierte Implementierung: alle Bonds werden gleichzeitig verarbeitet,
+    nur die 9 m-Werte werden in einer kleinen Schleife iteriert.
     """
     from ase.neighborlist import neighbor_list
     from scipy.special import sph_harm_y
 
     try:
-        i, j, d, D = neighbor_list("ijdD", atoms, cutoff)
+        i, _j, _d, D = neighbor_list("ijdD", atoms, cutoff)
     except Exception:
         return 0.0
 
     if i.size == 0:
         return 0.0
 
-    q4_sq = 0.0
     n_atoms = len(atoms)
-    # Für jedes Atom: mittlere Y_{4,m} über Nachbarn
-    for atom_idx in range(n_atoms):
-        mask = i == atom_idx
-        if not np.any(mask):
-            continue
-        dv = D[mask]            # (n_nb, 3)
-        norms = np.linalg.norm(dv, axis=1)
-        norms[norms == 0] = 1.0
-        theta = np.arccos(dv[:, 2] / norms)      # polar
-        phi = np.arctan2(dv[:, 1], dv[:, 0])      # azimuthal
-        qm = np.zeros(9, dtype=complex)           # m = -4 … 4
-        for m_idx, m in enumerate(range(-4, 5)):
-            qm[m_idx] = np.mean(sph_harm_y(4, m, theta, phi))
-        q4_sq += np.sum(np.abs(qm) ** 2)
+
+    # Polarkoordinaten für alle Bonds auf einmal
+    dv = D  # (n_bonds, 3)
+    norms = np.linalg.norm(dv, axis=1)
+    norms[norms == 0] = 1.0
+    theta = np.arccos(dv[:, 2] / norms)  # (n_bonds,)
+    phi = np.arctan2(dv[:, 1], dv[:, 0])  # (n_bonds,)
+
+    # Nachbarschafts-Zählungen pro Atom (für Mittelung)
+    counts = np.bincount(i, minlength=n_atoms)  # (n_atoms,)
+
+    q4_sq = 0.0
+    for m in range(-4, 5):
+        ylm = sph_harm_y(4, m, theta, phi)  # (n_bonds,) complex
+        # Per-Atom Mittelwert über bincount (vektorisiert)
+        atom_sums = (
+            np.bincount(i, weights=ylm.real, minlength=n_atoms)
+            + 1j * np.bincount(i, weights=ylm.imag, minlength=n_atoms)
+        )
+        atom_means = np.zeros(n_atoms, dtype=complex)
+        mask = counts > 0
+        atom_means[mask] = atom_sums[mask] / counts[mask]
+        q4_sq += np.sum(np.abs(atom_means) ** 2)
 
     q4 = np.sqrt(4 * np.pi / 9 * q4_sq / n_atoms)
     return float(q4)
