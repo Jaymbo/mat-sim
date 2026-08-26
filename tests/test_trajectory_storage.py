@@ -13,8 +13,10 @@ from mat_sim.acquisition import MPEntry
 from mat_sim.metrics import StepMetrics, TrajectoryResult
 from mat_sim.storage import (
     init_db,
+    ingest_structures,
     load_result,
     reconstruct_atoms_at_step,
+    requeue_materials,
     store_result,
 )
 
@@ -291,3 +293,78 @@ def test_store_overwrites_trajectory(tmp_db: str) -> None:
 
     assert loaded.positions_history is not None
     assert len(loaded.positions_history) == 5  # zweite Speicherung gewinnt
+
+
+# ── Tests: requeue_materials (archive roundtrip) ────────────────────────────
+
+def test_requeue_materials_archives_and_deletes(tmp_db: str) -> None:
+    """requeue_materials archiviert in materials_archive und löscht aus materials."""
+    import sqlite3
+
+    conn = init_db(tmp_db)
+    entry = _make_entry()
+    result = _make_result(n_steps=3, n_atoms=2)
+    result.t_switch = 100.0
+
+    # Struktur in Queue einfügen (damit requeue die structures-Tabelle updated)
+    ingest_structures(tmp_db, [entry], "O")
+
+    store_result(conn, entry, result)
+    conn.close()
+
+    # Re-queue: archiviert als v1 und löscht aus materials
+    n = requeue_materials(tmp_db, ["mp-test"], version_label="v1")
+    assert n >= 1
+
+    # materials sollte leer sein
+    with pytest.raises(KeyError):
+        load_result(tmp_db, "mp-test")
+
+    # materials_archive sollte den Eintrag haben
+    conn = sqlite3.connect(tmp_db)
+    row = conn.execute(
+        "SELECT material_id, t_switch, version_label, formula "
+        "FROM materials_archive WHERE material_id = ?",
+        ("mp-test",),
+    ).fetchone()
+    conn.close()
+
+    assert row is not None
+    assert row[0] == "mp-test"
+    assert row[1] == 100.0
+    assert row[2] == "v1"
+    assert row[3] == "O2"
+
+
+def test_requeue_materials_preserves_trajectory_in_archive(tmp_db: str) -> None:
+    """Archivierter Eintrag behält positions_history und symbols."""
+    import sqlite3
+
+    conn = init_db(tmp_db)
+    entry = _make_entry()
+    result = _make_result(n_steps=3, n_atoms=2)
+
+    ingest_structures(tmp_db, [entry], "O")
+    store_result(conn, entry, result)
+    conn.close()
+
+    requeue_materials(tmp_db, ["mp-test"], version_label="v1")
+
+    conn = sqlite3.connect(tmp_db)
+    row = conn.execute(
+        "SELECT positions_history_json, cell_history_json, symbols_json "
+        "FROM materials_archive WHERE material_id = ?",
+        ("mp-test",),
+    ).fetchone()
+    conn.close()
+
+    assert row is not None
+    assert row[0] is not None  # positions_history_json
+    assert row[1] is not None  # cell_history_json
+    assert row[2] is not None  # symbols_json
+
+
+def test_requeue_materials_nonexistent(tmp_db: str) -> None:
+    """Re-queue eines nicht existierenden Materials: kein Fehler, n=0."""
+    n = requeue_materials(tmp_db, ["mp-nonexistent"], version_label="v1")
+    assert n == 0

@@ -904,18 +904,29 @@ def requeue_materials(
                 "SELECT * FROM materials WHERE material_id = ?", (mid,)
             ).fetchone()
             if row is not None:
-                # Alle Spalten aus materials übernehmen + version_label
-                cols = [desc[0] for desc in conn.execute(
-                    "SELECT * FROM materials LIMIT 1"
-                ).description]
-                placeholders = ", ".join(["?"] * len(cols)) + ", ?"
-                col_names = ", ".join(cols) + ", version_label"
+                # Gemeinsame Spalten zwischen materials und materials_archive
+                # (materials hat created_at, materials_archive hat archived_at → nicht kopieren)
+                archive_cols = [
+                    "material_id", "formula", "status", "t_switch", "t_decay",
+                    "rdf_before_json", "rdf_after_json",
+                    "temperatures", "msd_values", "ql_values", "volumes", "energies",
+                    "structure_before_json", "structure_after_json", "rdf_history_json",
+                    "cooling_score", "heating_score", "total_score", "contrast_score",
+                    "optical_evaluated",
+                    "positions_history_json", "cell_history_json", "symbols_json",
+                ]
+                col_idx = {desc[0]: i for i, desc in enumerate(
+                    conn.execute("SELECT * FROM materials LIMIT 1").description
+                )}
+                values = [row[col_idx[c]] for c in archive_cols]
+                placeholders = ", ".join(["?"] * len(archive_cols)) + ", ?"
+                col_names = ", ".join(archive_cols) + ", version_label"
                 conn.execute(
                     f"INSERT INTO materials_archive ({col_names}) VALUES ({placeholders})",
-                    (*row, version_label),
+                    (*values, version_label),
                 )
                 logger.info("Archiviert %s als %s (t_switch=%s)",
-                            mid, version_label, row[3])
+                            mid, version_label, row[col_idx["t_switch"]])
 
             # Status in structures-Tabelle zurücksetzen
             cur = conn.execute(
