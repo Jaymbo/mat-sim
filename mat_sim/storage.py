@@ -10,14 +10,20 @@ Tabellen
     material_id, formula, t_switch, t_decay, rdf_before (JSON), rdf_after (JSON),
     temperature_ramp (JSON), msd_curve (JSON)
 
+``checkpoints`` – Zwischenspeicher für Resume nach SLURM-Time-Out:
+    material_id, step_index, temperature, positions_json, cell_json,
+    metrics_json, created_at
+    Ermöglicht die Fortsetzung einer MD-Rampe nach Job-Abbruch.
+
 Workflow
 --------
 1. **Ingest**: ``ingest_structures()`` lädt Strukturen von MP → ``structures``
    (status='pending').  Einmal pro chemisches System.
 2. **Process**: ``claim_next_structure()`` holt atomar die nächste pending-
    Struktur (status → 'processing').  Nach Simulation → 'done'.
+   **Priorisierung**: Strukturen mit Checkpoint werden zuerst geclaimt.
 3. **Recovery**: ``reset_stale()`` setzt abgestürzte 'processing'-Einträge
-   nach Timeout zurück auf 'pending'.
+   nach Timeout zurück auf 'pending'.  Checkpoints bleiben erhalten.
 """
 
 from __future__ import annotations
@@ -131,6 +137,26 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_materials_archive_mid
         ON materials_archive(material_id)
+    """)
+
+    # ── checkpoints: Zwischenspeicher für Resume nach SLURM-Time-Out ───────
+    # Speichert nach jedem Temperaturschritt den aktuellen Zustand (Positionen,
+    # Zelle, Metriken).  Beim nächsten Job wird die Rampe ab diesem Schritt
+    # fortgesetzt, anstatt von 0 K neu zu beginnen.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS checkpoints (
+            material_id     TEXT PRIMARY KEY,
+            step_index      INTEGER NOT NULL,
+            temperature     REAL NOT NULL,
+            positions_json  TEXT NOT NULL,
+            cell_json       TEXT NOT NULL,
+            metrics_json    TEXT NOT NULL,
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_checkpoints_mid
+        ON checkpoints(material_id)
     """)
 
     conn.commit()
@@ -553,6 +579,10 @@ def claim_next_structure(
 ) -> QueuedStructure | None:
     """Atomar die nächste pending-Struktur claimen (status → 'processing').
 
+    **Priorisierung**: Strukturen mit Checkpoint (infolge vorherigem
+    SLURM-Time-Out) werden zuerst geclaimt, damit die Rampe fortgesetzt
+    wird statt neu zu beginnen.
+
     Verwendet eine SQLite-Transaktion, um sicherzustellen, dass keine zwei
     Worker dieselbe Struktur bekommen.
 
@@ -564,15 +594,30 @@ def claim_next_structure(
     conn = init_db(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
+
+        # Priorität 1: pending-Strukturen MIT Checkpoint (Resume)
         row = conn.execute(
             """
-            SELECT material_id, formula, chemsys, structure_json
-            FROM structures
-            WHERE status = 'pending'
-            ORDER BY material_id
+            SELECT s.material_id, s.formula, s.chemsys, s.structure_json
+            FROM structures s
+            INNER JOIN checkpoints c ON s.material_id = c.material_id
+            WHERE s.status = 'pending'
+            ORDER BY c.updated_at ASC
             LIMIT 1
             """
         ).fetchone()
+
+        # Priorität 2: pending-Strukturen OHNE Checkpoint (neu)
+        if row is None:
+            row = conn.execute(
+                """
+                SELECT material_id, formula, chemsys, structure_json
+                FROM structures
+                WHERE status = 'pending'
+                ORDER BY material_id
+                LIMIT 1
+                """
+            ).fetchone()
 
         if row is None:
             conn.execute("ROLLBACK")
@@ -739,3 +784,122 @@ def requeue_materials(
     finally:
         conn.close()
     return n
+
+
+# ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══
+#  CHECKPOINTS (Resume nach SLURM-Time-Out)
+# ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══ ══
+
+
+@dataclass
+class CheckpointData:
+    """Zwischengespeicherter Zustand einer MD-Rampe.
+
+    Attributes
+    ----------
+    step_index
+        Index des letzten abgeschlossenen Temperaturschritts (0-basiert).
+    temperature
+        Temperatur des letzten abgeschlossenen Schritts in K.
+    positions
+        Atompositionen (N, 3) nach dem letzten Schritt.
+    cell
+        Zellvektoren (3, 3) nach dem letzten Schritt.
+    metrics
+        Bisher gesammelte Metriken als JSON-String:
+        ``{"temperatures": [...], "volumes": [...], "msd_values": [...],
+           "ql_values": [...], "energies": [...],
+           "rdf_history": [{"r": [...], "g": [...]}, ...],
+           "positions_history": [...], "cell_history": [...]}``
+    """
+
+    step_index: int
+    temperature: float
+    positions: np.ndarray
+    cell: np.ndarray
+    metrics: str  # JSON
+
+
+def save_checkpoint(
+    db_path: str | Path,
+    material_id: str,
+    step_index: int,
+    temperature: float,
+    positions: np.ndarray,
+    cell: np.ndarray,
+    metrics: str,
+) -> None:
+    """Checkpoint nach einem Temperaturschritt speichern (Insert-or-Replace).
+
+    Wird nach jedem abgeschlossenen Temperaturschritt aufgerufen, damit
+    bei SLURM-Time-Out der nächste Job an dieser Stelle fortsetzen kann.
+    """
+    conn = init_db(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO checkpoints
+                (material_id, step_index, temperature,
+                 positions_json, cell_json, metrics_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                material_id,
+                step_index,
+                temperature,
+                json.dumps(positions.tolist()),
+                json.dumps(cell.tolist()),
+                metrics,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_checkpoint(db_path: str | Path, material_id: str) -> CheckpointData | None:
+    """Checkpoint für ein Material laden, oder *None* wenn keiner existiert."""
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT step_index, temperature, positions_json, cell_json, metrics_json
+            FROM checkpoints WHERE material_id = ?
+            """,
+            (material_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        return None
+
+    return CheckpointData(
+        step_index=row[0],
+        temperature=row[1],
+        positions=np.array(json.loads(row[2])),
+        cell=np.array(json.loads(row[3])),
+        metrics=row[4],
+    )
+
+
+def delete_checkpoint(db_path: str | Path, material_id: str) -> None:
+    """Checkpoint löschen (nach erfolgreicher Simulation)."""
+    conn = init_db(db_path)
+    try:
+        conn.execute("DELETE FROM checkpoints WHERE material_id = ?", (material_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def has_checkpoint(db_path: str | Path, material_id: str) -> bool:
+    """Prüfen, ob ein Checkpoint für dieses Material existiert."""
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM checkpoints WHERE material_id = ?", (material_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None

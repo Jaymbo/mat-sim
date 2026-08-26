@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
@@ -38,7 +38,7 @@ uv run python -m mat_sim.run --queue-stats --db results.db
 uv run python -m mat_sim.run \
     --db results.db \
     --device auto \
-    --duration-min 110 \
+    --duration-min 25 \
     --t-max 1200 \
     --delta-t 10 \
     --therm-steps 500

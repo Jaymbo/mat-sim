@@ -161,28 +161,57 @@ class ThermalRamp:
         self.cfg = config or RampConfig()
 
     # ── öffentliche API ─────────────────────────────────────────────────────
-    def run(self) -> TrajectoryResult:
-        """Komplette Temperaturrampe ausführen und Ergebnis zurückgeben."""
+    def run(
+        self,
+        deadline: float | None = None,
+        checkpoint_cb=None,
+        resume_step: int = 0,
+        initial_result: TrajectoryResult | None = None,
+    ) -> TrajectoryResult:
+        """Komplette Temperaturrampe ausführen und Ergebnis zurückgeben.
+
+        Parameters
+        ----------
+        deadline
+            Absolute Zeit in Sekunden (``time.perf_counter()``), ab der die
+            Rampe sauber nach dem nächsten Temperaturschritt abbricht.
+            Der aktuelle Fortschritt wird über ``checkpoint_cb`` gespeichert.
+        checkpoint_cb
+            Callback ``cb(step_index, temperature, result)``, der nach jedem
+            abgeschlossenen Temperaturschritt aufgerufen wird, um einen
+            Checkpoint zu speichern.
+        resume_step
+            Index des Schritts, ab dem die Rampe fortgesetzt wird (0 = neu).
+            Wird mit ``resume_positions`` / ``resume_cell`` kombiniert.
+        initial_result
+            Vorausgefülltes ``TrajectoryResult`` (für Resume: enthält die
+            Metriken aller bisherigen Schritte).  Wenn *None*, wird ein
+            neues leeres Objekt erstellt.
+        """
         cfg = self.cfg
-        result = TrajectoryResult()
+        result = initial_result or TrajectoryResult()
 
         logger.info(
-            "Starte Rampe: %s | N=%d",
+            "Starte Rampe: %s | N=%d | resume_step=%d",
             self.atoms.get_chemical_formula(),
             len(self.atoms),
+            resume_step,
         )
 
-        # --- Schritt 1: Geometrieoptimierung bei T ≈ 0 K ----------------
-        logger.info("Geometrieoptimierung (BFGS, fmax=%.3f eV/Å) …", cfg.fmax)
-        try:
-            self._optimize_geometry()
-        except Exception as exc:
-            logger.error("Geometrieoptimierung fehlgeschlagen: %s", exc)
-            result.status = "diverged"
-            return result
+        # --- Schritt 1: Geometrieoptimierung ODER Resume ----------------
+        if resume_step > 0:
+            logger.info("Resume ab Schritt %d — überspringe Optimierung.", resume_step)
+            initial_positions = self.atoms.get_positions().copy()
+        else:
+            logger.info("Geometrieoptimierung (BFGS, fmax=%.3f eV/Å) …", cfg.fmax)
+            try:
+                self._optimize_geometry()
+            except Exception as exc:
+                logger.error("Geometrieoptimierung fehlgeschlagen: %s", exc)
+                result.status = "diverged"
+                return result
+            initial_positions = self.atoms.get_positions().copy()
 
-        # Referenzpositionen nach Optimierung speichern
-        initial_positions = self.atoms.get_positions().copy()
         nn_dist = nearest_neighbor_distance(self.atoms)
         logger.info(
             "Optimiert | d_NN=%.3f Å | V=%.1f Å³",
@@ -191,10 +220,11 @@ class ThermalRamp:
         )
 
         # --- Schritt 2: NPT-MD initialisieren ----------------------------
+        start_temp = max(cfg.t_start, 1e-3)
         dyn = NPT(
             self.atoms,
             timestep=cfg.time_step * fs,
-            temperature_K=max(cfg.t_start, 1e-3),
+            temperature_K=start_temp,
             externalstress=cfg.pressure * GPa,
             ttime=cfg.temperature_time_constant,
             # pfactor = τ_P² × B  (B = Bulk-Modulus in ASE-Einheiten)
@@ -210,9 +240,16 @@ class ThermalRamp:
             cfg.t_start, cfg.t_max + cfg.delta_t, cfg.delta_t
         )
 
+        # Beim Resume: ab resume_step+1 weitermachen
+        if resume_step > 0:
+            temperatures = temperatures[resume_step + 1:]
+
         # --- Schritt 3: Temperaturschleife --------------------------------
         n_steps_total = len(temperatures)
+        timed_out = False
+
         for i, T in enumerate(temperatures):
+            global_step = resume_step + 1 + i
             T_sim = max(T, 1e-3)  # 0 K vermeiden
             dyn.set_temperature(temperature_K=T_sim)
 
@@ -223,7 +260,7 @@ class ThermalRamp:
                 break
 
             print(f"-> Starte MD-Simulation für T = {T:.1f} K ... "
-                  f"(Schritt {i + 1}/{n_steps_total})", flush=True)
+                  f"(Schritt {global_step}/{resume_step + n_steps_total})", flush=True)
 
             # Thermalisieren (mit Profiling + Early Stopping)
             monitor.reset()
@@ -258,6 +295,20 @@ class ThermalRamp:
             print(f"   [ERFOLG] T = {T:.1f} K nach {elapsed:.2f} Sekunden beendet. "
                   f"(MSD: {metrics.msd:.4f})", flush=True)
 
+            # ── Checkpoint nach jedem Schritt ────────────────────────────
+            if checkpoint_cb is not None:
+                checkpoint_cb(global_step, T, result)
+
+            # ── Deadline-Check: sauber abbrechen nach vollem Schritt ─────
+            if deadline is not None and time.perf_counter() > deadline:
+                logger.warning(
+                    "Deadline erreicht nach T=%.1f K (Schritt %d) — breche ab.",
+                    T, global_step,
+                )
+                result.status = "timed_out"
+                timed_out = True
+                break
+
             # Frühzeitiger Abbruch bei Zerfall (Lindemann)
             if (
                 result.t_decay is None
@@ -270,20 +321,21 @@ class ThermalRamp:
                       flush=True)
                 break
 
-        # --- Post-Processing ---------------------------------------------
-        if result.t_switch is None and len(result.rdf_history) >= 2:
-            result.t_switch = detect_t_switch(
-                result.rdf_history,
-                result.temperatures,
-                volumes=result.volumes,
-            )
-        if result.t_decay is None and len(result.msd_values) >= 1:
-            result.t_decay = detect_t_decay(
-                result.msd_values,
-                result.temperatures,
-                nn_distance=nn_dist,
-                lindemann_fraction=cfg.lindemann_fraction,
-            )
+        # --- Post-Processing (nur wenn nicht timed_out) -----------------
+        if not timed_out:
+            if result.t_switch is None and len(result.rdf_history) >= 2:
+                result.t_switch = detect_t_switch(
+                    result.rdf_history,
+                    result.temperatures,
+                    volumes=result.volumes,
+                )
+            if result.t_decay is None and len(result.msd_values) >= 1:
+                result.t_decay = detect_t_decay(
+                    result.msd_values,
+                    result.temperatures,
+                    nn_distance=nn_dist,
+                    lindemann_fraction=cfg.lindemann_fraction,
+                )
 
         logger.info(
             "Rampe beendet: status=%s, T_switch=%s, T_decay=%s",

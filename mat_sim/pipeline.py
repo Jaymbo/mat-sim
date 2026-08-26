@@ -24,6 +24,7 @@ SLURM Time-Out-Handling:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
@@ -31,23 +32,27 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
+import numpy as np
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 
-from .acquisition import MPEntry, query_mp_structures, pmg_to_ase
+from .acquisition import MPEntry, pmg_to_ase, query_mp_structures
 from .calculator import get_calculator
-from .md import ThermalRamp, RampConfig
+from .md import RampConfig, ThermalRamp
 from .metrics import TrajectoryResult
 from .storage import (
-    init_db,
-    store_result,
-    ingest_structures,
+    _structure_from_json,
     claim_next_structure,
+    delete_checkpoint,
+    ingest_structures,
+    init_db,
+    load_checkpoint,
     mark_structure_done,
     mark_structure_error,
-    reset_stale,
     queue_stats,
-    _structure_from_json,
+    reset_stale,
+    save_checkpoint,
+    store_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -209,7 +214,13 @@ def run_pipeline(cfg: PipelineConfig) -> int:
             continue
 
         # MD-Simulation
-        _process_single(entry, atoms, calc, cfg.ramp, conn)
+        deadline = time.perf_counter() + _time_remaining() - _TIMEOUT_BUFFER_S
+        _process_single(
+            entry, atoms, calc, cfg.ramp, conn,
+            db_path=cfg.db_path,
+            material_id=queued.material_id,
+            deadline=deadline,
+        )
         mark_structure_done(cfg.db_path, queued.material_id)
         processed += 1
 
@@ -242,25 +253,119 @@ def run_pipeline(cfg: PipelineConfig) -> int:
     return 0
 
 
+def _serialize_result(result: TrajectoryResult) -> str:
+    """TrajectoryResult als JSON-String für Checkpoint serialisieren."""
+    return json.dumps({
+        "temperatures": result.temperatures,
+        "volumes": result.volumes,
+        "energies": result.energies,
+        "msd_values": result.msd_values,
+        "ql_values": result.ql_values,
+        "rdf_history": [
+            {"r": r.tolist(), "g": g.tolist()}
+            for r, g in result.rdf_history
+        ],
+        "positions_history": [
+            p.tolist() for p in result.positions_history
+        ],
+        "cell_history": [
+            c.tolist() for c in result.cell_history
+        ],
+        "t_switch": result.t_switch,
+        "t_decay": result.t_decay,
+        "status": result.status,
+    })
+
+
+def _deserialize_result(metrics_json: str) -> TrajectoryResult:
+    """JSON-String → TrajectoryResult (für Resume)."""
+    obj = json.loads(metrics_json)
+    result = TrajectoryResult(
+        temperatures=obj.get("temperatures", []),
+        volumes=obj.get("volumes", []),
+        energies=obj.get("energies", []),
+        msd_values=obj.get("msd_values", []),
+        ql_values=obj.get("ql_values", []),
+        t_switch=obj.get("t_switch"),
+        t_decay=obj.get("t_decay"),
+        status=obj.get("status", "converged"),
+    )
+    result.rdf_history = [
+        (np.array(item["r"]), np.array(item["g"]))
+        for item in obj.get("rdf_history", [])
+    ]
+    result.positions_history = [
+        np.array(p) for p in obj.get("positions_history", [])
+    ]
+    result.cell_history = [
+        np.array(c) for c in obj.get("cell_history", [])
+    ]
+    return result
+
+
 def _process_single(
     entry: MPEntry,
     atoms: Atoms,
     calc: Calculator,
     ramp_cfg: RampConfig,
     conn,
+    db_path: str,
+    material_id: str,
+    deadline: float | None = None,
 ) -> None:
-    """Eine einzelne Struktur durch die Rampen-Engine schicken."""
-    atoms.calc = calc  # Calculator anhängen (wird von ThermalRamp verlangt)
+    """Eine einzelne Struktur durch die Rampen-Engine schicken.
 
+    Unterstützt Checkpoint/Resume: lädt vorhandenen Checkpoint, stellt
+    Atompositionen/Zelle/Metriken wieder her und übergibt eine Deadline
+    für sauberes Time-Out-Handling.
+    """
+    atoms.calc = calc
+
+    # ── Checkpoint laden (falls vorhanden → Resume) ──────────────────
+    cp = load_checkpoint(db_path, material_id)
+    resume_step = 0
+    initial_result: TrajectoryResult | None = None
+
+    if cp is not None:
+        logger.info(
+            "Checkpoint gefunden: Schritt %d, T=%.1f K — Resume.",
+            cp.step_index, cp.temperature,
+        )
+        atoms.set_positions(cp.positions)
+        atoms.set_cell(cp.cell)
+        resume_step = cp.step_index
+        initial_result = _deserialize_result(cp.metrics)
+
+    # ── Checkpoint-Callback ──────────────────────────────────────────
+    def _checkpoint_cb(step_index: int, temperature: float,
+                       result: TrajectoryResult) -> None:
+        metrics_json = _serialize_result(result)
+        save_checkpoint(
+            db_path,
+            material_id,
+            step_index,
+            temperature,
+            atoms.get_positions(),
+            atoms.get_cell(),
+            metrics_json,
+        )
+
+    # ── MD-Simulation ────────────────────────────────────────────────
     try:
         ramp = ThermalRamp(atoms, config=ramp_cfg)
-        result: TrajectoryResult = ramp.run()
+        result: TrajectoryResult = ramp.run(
+            deadline=deadline,
+            checkpoint_cb=_checkpoint_cb,
+            resume_step=resume_step,
+            initial_result=initial_result,
+        )
         snapshots = ramp.snapshots_around_t_switch(result)
     except Exception as exc:  # noqa: BLE001
         logger.error("Fehler bei %s: %s", entry.material_id, exc)
         result = TrajectoryResult(status="diverged")
         snapshots = {}
 
+    # ── Ergebnis speichern ───────────────────────────────────────────
     store_result(conn, entry, result, snapshots)
     logger.info(
         "%s gespeichert: status=%s, T_switch=%s, T_decay=%s",
@@ -269,3 +374,9 @@ def _process_single(
         result.t_switch,
         result.t_decay,
     )
+
+    # ── Checkpoint aufräumen (nur bei vollständiger Fertigstellung) ──
+    if result.status != "timed_out":
+        delete_checkpoint(db_path, material_id)
+        logger.info("Checkpoint für %s gelöscht (Simulation abgeschlossen).",
+                     material_id)
