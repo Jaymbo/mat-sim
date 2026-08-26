@@ -99,6 +99,40 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         "optical_evaluated": "TIMESTAMP",
     })
 
+    # ── materials_archive: gleiche Spalten wie materials + version_label ────
+    # Speichert alte Simulationsergebnisse vor Re-Simulation.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS materials_archive (
+            archive_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            material_id     TEXT NOT NULL,
+            formula         TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'converged',
+            t_switch        REAL,
+            t_decay         REAL,
+            rdf_before_json TEXT,
+            rdf_after_json  TEXT,
+            temperatures    TEXT,
+            msd_values      TEXT,
+            ql_values       TEXT,
+            volumes         TEXT,
+            energies        TEXT,
+            structure_before_json TEXT,
+            structure_after_json  TEXT,
+            rdf_history_json      TEXT,
+            cooling_score   REAL,
+            heating_score   REAL,
+            total_score     REAL,
+            contrast_score  REAL,
+            optical_evaluated TIMESTAMP,
+            version_label   TEXT,
+            archived_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_materials_archive_mid
+        ON materials_archive(material_id)
+    """)
+
     conn.commit()
     return conn
 
@@ -643,16 +677,24 @@ def queue_stats(db_path: str | Path) -> dict[str, int]:
     return stats
 
 
-def requeue_materials(db_path: str | Path, material_ids: list[str]) -> int:
+def requeue_materials(
+    db_path: str | Path,
+    material_ids: list[str],
+    version_label: str = "v1",
+) -> int:
     """Materialien für erneute Simulation zurück in die Queue stellen.
 
-    Setzt den Status in der ``structures``-Tabelle auf 'pending' und löscht
-    vorhandene Ergebnisse aus der ``materials``-Tabelle.
+    Sichert vorhandene Ergebnisse in die ``materials_archive``-Tabelle,
+    bevor sie aus ``materials`` gelöscht werden.  So bleiben alte und neue
+    Simulationsergebnisse vergleichbar.
 
     Parameters
     ----------
     material_ids
         Liste von MP-IDs (z. B. ``["mp-18248", "mp-19227"]``).
+    version_label
+        Label für die archivierte Version (z. B. ``"v1"`` für die
+        ursprünglichen 600K/100-Step-Ergebnisse).
 
     Returns
     -------
@@ -663,6 +705,24 @@ def requeue_materials(db_path: str | Path, material_ids: list[str]) -> int:
     n = 0
     try:
         for mid in material_ids:
+            # ── Alte Ergebnisse archivieren (nur wenn vorhanden) ────────
+            row = conn.execute(
+                "SELECT * FROM materials WHERE material_id = ?", (mid,)
+            ).fetchone()
+            if row is not None:
+                # Alle Spalten aus materials übernehmen + version_label
+                cols = [desc[0] for desc in conn.execute(
+                    "SELECT * FROM materials LIMIT 1"
+                ).description]
+                placeholders = ", ".join(["?"] * len(cols)) + ", ?"
+                col_names = ", ".join(cols) + ", version_label"
+                conn.execute(
+                    f"INSERT INTO materials_archive ({col_names}) VALUES ({placeholders})",
+                    (*row, version_label),
+                )
+                logger.info("Archiviert %s als %s (t_switch=%s)",
+                            mid, version_label, row[3])
+
             # Status in structures-Tabelle zurücksetzen
             cur = conn.execute(
                 """

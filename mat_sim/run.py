@@ -43,11 +43,15 @@ Optionen (Ingest)
 
 Optionen (Process)
     --device          cpu | cuda | auto  (Default: cpu)
-    --t-max           Maximaltemperatur in K          (Default: 600)
+    --t-max           Maximaltemperatur in K          (Default: 1200)
     --delta-t         Temperaturschritt in K          (Default: 10)
-    --therm-steps     Thermalisierungs-Schritte pro T (Default: 100)
+    --therm-steps     Thermalisierungs-Schritte pro T (Default: 500)
     --duration-min    Max. Laufzeit in Minuten (SLURM) (Default: 25)
     --stale-minutes   processing-Timeout für Reset    (Default: 30)
+
+Optionen (Re-Simulation)
+    --resimulate      Material-IDs (mp-xxxx) erneut simulieren
+    --version-label   Label für archivierte alte Ergebnisse (Default: v1)
 
 Optionen (Analyse)
     --analyze        Aktiviert den Analyse-Modus
@@ -145,6 +149,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Stale 'processing'-Einträge zurück auf 'pending' setzen")
     p.add_argument("--resimulate", nargs="+", default=None,
                    help="Material-IDs (mp-xxxx) erneut simulieren: 'done' → 'pending' in Queue")
+    p.add_argument("--version-label", type=str, default="v1",
+                   help="Label für archivierte alte Ergebnisse (Default: v1)")
 
     return p.parse_args(argv)
 
@@ -263,14 +269,14 @@ def _run_reset_stale(args: argparse.Namespace) -> int:
 def _run_resimulate(args: argparse.Namespace) -> int:
     """Materialien für erneute Simulation zurück in die Queue stellen.
 
-    Setzt den Status in der ``structures``-Tabelle von 'done' auf 'pending'
-    und löscht ggf. vorhandene Ergebnisse aus der ``materials``-Tabelle.
+    Sichert vorhandene Ergebnisse in ``materials_archive`` (mit version_label),
+    bevor sie aus ``materials`` gelöscht werden.
     """
     from .storage import requeue_materials
 
     material_ids = args.resimulate or []
-    n = requeue_materials(args.db, material_ids)
-    print(f"{n} Materialien zurück in die Queue gestellt (status → pending).")
+    n = requeue_materials(args.db, material_ids, version_label=args.version_label)
+    print(f"{n} Materialien archiviert ({args.version_label}) und zurück in die Queue gestellt.")
     print(f"Starte Pipeline mit: python -m mat_sim.run --db {args.db} --device auto")
     return 0
 
