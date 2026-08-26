@@ -35,11 +35,15 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .acquisition import MPEntry
 from .metrics import TrajectoryResult
+
+if TYPE_CHECKING:
+    from ase import Atoms
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +107,9 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
         "total_score": "REAL",
         "contrast_score": "REAL",
         "optical_evaluated": "TIMESTAMP",
+        "positions_history_json": "TEXT",
+        "cell_history_json": "TEXT",
+        "symbols_json": "TEXT",
     })
 
     # ── materials_archive: gleiche Spalten wie materials + version_label ────
@@ -130,6 +137,9 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
             total_score     REAL,
             contrast_score  REAL,
             optical_evaluated TIMESTAMP,
+            positions_history_json TEXT,
+            cell_history_json      TEXT,
+            symbols_json           TEXT,
             version_label   TEXT,
             archived_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -190,6 +200,36 @@ def _rdf_history_from_json(raw: str | None) -> list[tuple[np.ndarray, np.ndarray
         return None
     obj = json.loads(raw)
     return [(np.array(item["r"]), np.array(item["g"])) for item in obj]
+
+
+def _positions_history_to_json(history: list[np.ndarray]) -> str | None:
+    """Liste von (N, 3)-Positionsmatrizen als JSON serialisieren."""
+    if not history:
+        return None
+    return json.dumps([p.tolist() for p in history])
+
+
+def _positions_history_from_json(raw: str | None) -> list[np.ndarray] | None:
+    """JSON → Liste von (N, 3)-Positionsmatrizen deserialisieren."""
+    if raw is None:
+        return None
+    obj = json.loads(raw)
+    return [np.array(p) for p in obj]
+
+
+def _cell_history_to_json(history: list[np.ndarray]) -> str | None:
+    """Liste von (3, 3)-Zellmatrizen als JSON serialisieren."""
+    if not history:
+        return None
+    return json.dumps([c.tolist() for c in history])
+
+
+def _cell_history_from_json(raw: str | None) -> list[np.ndarray] | None:
+    """JSON → Liste von (3, 3)-Zellmatrizen deserialisieren."""
+    if raw is None:
+        return None
+    obj = json.loads(raw)
+    return [np.array(c) for c in obj]
 
 
 def _atoms_to_json(atoms) -> str:
@@ -270,6 +310,21 @@ def store_result(
             atoms_after = atoms_json
 
     rdf_history_json = _rdf_history_to_json(result.rdf_history) if result.rdf_history else None
+    positions_history_json = _positions_history_to_json(result.positions_history)
+    cell_history_json = _cell_history_to_json(result.cell_history)
+
+    # Atom-Symbole aus der Original-Struktur extrahieren (für Rekonstruktion).
+    # Symbole ändern sich nicht zwischen Temperaturschritten, einmal speichern genügt.
+    symbols_json = None
+    if hasattr(entry, "structure") and entry.structure is not None:
+        try:
+            from pymatgen.core import Structure
+            if isinstance(entry.structure, Structure):
+                symbols_json = json.dumps([
+                    str(site.specie.symbol) for site in entry.structure
+                ])
+        except (ImportError, AttributeError, TypeError):
+            logger.warning("Konnte Symbole nicht aus entry.structure extrahieren")
 
     conn.execute(
         """
@@ -277,8 +332,9 @@ def store_result(
             (material_id, formula, status, t_switch, t_decay,
              rdf_before_json, rdf_after_json,
              temperatures, msd_values, ql_values, volumes, energies,
-             structure_before_json, structure_after_json, rdf_history_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             structure_before_json, structure_after_json, rdf_history_json,
+             positions_history_json, cell_history_json, symbols_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             entry.material_id,
@@ -296,6 +352,9 @@ def store_result(
             atoms_before,
             atoms_after,
             rdf_history_json,
+            positions_history_json,
+            cell_history_json,
+            symbols_json,
         ),
     )
     conn.commit()
@@ -411,7 +470,14 @@ def store_batch(
 # ── Auslesen ────────────────────────────────────────────────────────────────
 @dataclass
 class StoredMaterial:
-    """Datensatz eines gespeicherten Materials (aus DB geladen)."""
+    """Datensatz eines gespeicherten Materials (aus DB geladen).
+
+    Neben den Skalar-Metriken und RDF-History enthält dieser Datensatz
+    auch die vollständige Trajektorie (``positions_history``,
+    ``cell_history``) sowie ``symbols``, sodass jederzeit ein
+    ``ase.Atoms``-Objekt für einen beliebigen Temperaturschritt
+    rekonstruiert werden kann (siehe :func:`reconstruct_atoms_at_step`).
+    """
 
     material_id: str
     formula: str
@@ -434,6 +500,10 @@ class StoredMaterial:
     total_score: float | None = None
     contrast_score: float | None = None
     optical_evaluated: str | None = None
+    # ── Vollständige Trajektorie (für spätere Analysen) ──
+    positions_history: list[np.ndarray] | None = None  # list[(N, 3)]
+    cell_history: list[np.ndarray] | None = None       # list[(3, 3)]
+    symbols: list[str] | None = None                    # ["O", "V", ...]
 
 
 def _rdf_from_json(raw: str | None) -> tuple[np.ndarray, np.ndarray] | None:
@@ -459,7 +529,8 @@ def load_result(db_path: str | Path, material_id: str) -> StoredMaterial:
             "temperatures, msd_values, ql_values, volumes, energies, "
             "structure_before_json, structure_after_json, rdf_history_json, "
             "cooling_score, heating_score, total_score, contrast_score, "
-            "optical_evaluated "
+            "optical_evaluated, "
+            "positions_history_json, cell_history_json, symbols_json "
             "FROM materials WHERE material_id = ?",
             (material_id,),
         ).fetchone()
@@ -490,6 +561,62 @@ def load_result(db_path: str | Path, material_id: str) -> StoredMaterial:
         total_score=row[17],
         contrast_score=row[18],
         optical_evaluated=row[19],
+        positions_history=_positions_history_from_json(row[20]) if len(row) > 20 else None,
+        cell_history=_cell_history_from_json(row[21]) if len(row) > 21 else None,
+        symbols=json.loads(row[22]) if len(row) > 22 and row[22] else None,
+    )
+
+
+def reconstruct_atoms_at_step(
+    stored: StoredMaterial,
+    step: int,
+) -> Atoms:
+    """``ase.Atoms``-Objekt für einen bestimmten Temperaturschritt rekonstruieren.
+
+    Nutzt die in der DB gespeicherte ``positions_history``, ``cell_history``
+    und ``symbols``, um die Atomstruktur zu einem beliebigen Schritt der
+    Temperaturrampe wiederherzustellen.
+
+    Parameters
+    ----------
+    stored
+        Ein via :func:`load_result` geladener :class:`StoredMaterial`.
+    step
+        0-basierter Index des Temperaturschritts.
+
+    Returns
+    -------
+    ase.Atoms
+        Rekonstruiertes Atoms-Objekt (ohne Calculator).
+
+    Raises
+    ------
+    ValueError
+        Wenn ``step`` außerhalb des gültigen Bereichs liegt oder die
+        Trajektorie nicht gespeichert wurde (alte DB-Einträge).
+    """
+    from ase import Atoms
+
+    if stored.positions_history is None or stored.cell_history is None:
+        raise ValueError(
+            f"Keine Trajektorie gespeichert für {stored.material_id!r} "
+            "(alte DB-Einträge ohne positions_history/cell_history)."
+        )
+    if stored.symbols is None:
+        raise ValueError(
+            f"Keine Symbole gespeichert für {stored.material_id!r}."
+        )
+    if not 0 <= step < len(stored.positions_history):
+        raise ValueError(
+            f"Schritt {step} außerhalb des gültigen Bereichs "
+            f"[0, {len(stored.positions_history) - 1}]."
+        )
+
+    return Atoms(
+        symbols=stored.symbols,
+        positions=stored.positions_history[step],
+        cell=stored.cell_history[step],
+        pbc=True,
     )
 
 
