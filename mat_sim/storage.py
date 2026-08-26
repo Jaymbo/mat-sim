@@ -641,3 +641,41 @@ def queue_stats(db_path: str | Path) -> dict[str, int]:
     stats.setdefault("error", 0)
     stats["total"] = sum(stats[s] for s in ("pending", "processing", "done", "error"))
     return stats
+
+
+def requeue_materials(db_path: str | Path, material_ids: list[str]) -> int:
+    """Materialien für erneute Simulation zurück in die Queue stellen.
+
+    Setzt den Status in der ``structures``-Tabelle auf 'pending' und löscht
+    vorhandene Ergebnisse aus der ``materials``-Tabelle.
+
+    Parameters
+    ----------
+    material_ids
+        Liste von MP-IDs (z. B. ``["mp-18248", "mp-19227"]``).
+
+    Returns
+    -------
+    int
+        Anzahl tatsächlich re-gequeueter Materialien.
+    """
+    conn = init_db(db_path)
+    n = 0
+    try:
+        for mid in material_ids:
+            # Status in structures-Tabelle zurücksetzen
+            cur = conn.execute(
+                """
+                UPDATE structures
+                SET status = 'pending', claimed_by = NULL, claimed_at = NULL
+                WHERE material_id = ?
+                """,
+                (mid,),
+            )
+            # Alte Ergebnisse aus materials-Tabelle löschen
+            conn.execute("DELETE FROM materials WHERE material_id = ?", (mid,))
+            n += cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return n

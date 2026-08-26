@@ -7,8 +7,8 @@ Implementiert:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
 
 import numpy as np
 from ase import Atoms
@@ -146,9 +146,8 @@ def compute_steinhardt_q4(atoms: Atoms, cutoff: float = 3.5) -> float:
     Hinweis:  Für produktiven Einsatz kann Q6 etc. ergänzt werden;
     Q4 reicht als Indikator für Oxid-Strukturen meist aus.
     """
-    from scipy.special import sph_harm_y
-
     from ase.neighborlist import neighbor_list
+    from scipy.special import sph_harm_y
 
     try:
         i, j, d, D = neighbor_list("ijdD", atoms, cutoff)
@@ -290,7 +289,7 @@ def detect_t_switch_from_scalars(
     ql_values: Sequence[float],
     temperatures: Sequence[float],
     volume_threshold: float = 0.03,
-    ql_threshold: float = 0.05,
+    ql_threshold: float = 0.10,
     min_persistence: int = 3,
 ) -> float | None:
     """T_switch aus Volumen- und Q4-Zeitreihen ableiten (ohne RDF-History).
@@ -302,7 +301,7 @@ def detect_t_switch_from_scalars(
        > ``volume_threshold`` (Default 3 %) zwischen aufeinanderfolgenden
        Temperaturschritten.
     2. **Q4-Sprung**: Diskontinuierliche Änderung des Steinhardt-Parameters
-       > ``ql_threshold`` (Default 0.05), die auf Symmetrie-Bruch hinweist.
+       > ``ql_threshold`` (Default 0.10), die auf Symmetrie-Bruch hinweist.
 
     Ein Phasenwechsel wird detektiert, wenn **mindestens eines** der beiden
     Signale einen Sprung zeigt.  Wenn beide Signale springen, erhöht sich

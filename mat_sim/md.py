@@ -19,11 +19,11 @@ import numpy as np
 from ase import Atoms
 from ase.md.melchionna import MelchionnaNPT as NPT
 from ase.optimize import LBFGS
-from ase.units import fs, GPa
+from ase.units import GPa, fs
 
 from .metrics import (
-    TrajectoryResult,
     StepMetrics,
+    TrajectoryResult,
     compute_msd,
     compute_rdf,
     compute_steinhardt_q4,
@@ -115,10 +115,10 @@ class RampConfig:
     """Parameter für die Temperaturrampe."""
 
     t_start: float = 0.0            # K
-    t_max: float = 600.0            # K
+    t_max: float = 1200.0           # K  (erhöht: deckt Übergänge bis ~1000 K ab)
     delta_t: float = 10.0           # K pro Schritt
-    thermalization_steps: int = 100     # Zeitschritte pro T-Stufe (CPU-Screening)
-    time_step: float = 0.5          # fs  (konservativ für Oxide + MLIP)
+    thermalization_steps: int = 500     # Zeitschritte pro T-Stufe (500 fs bei 1 fs/Step)
+    time_step: float = 1.0          # fs  (Standard für Oxid-MD)
     pressure: float = 1.0e-4        # GPa (≈ 1 atm)
     temperature_time_constant: float = 200.0 * fs   # τ_T (träge → stabil)
     pressure_time_constant: float = 2000.0 * fs     # τ_P (sehr träge)

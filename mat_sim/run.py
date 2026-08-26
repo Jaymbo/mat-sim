@@ -72,13 +72,13 @@ load_dotenv()
 # PyTorch-Thread-Limit NUR bei CPU-Nutzung (verhindert Thread-Overhead).
 # Bei GPU-Nutzung stören CPU-Thread-Limits nicht, aber wir sparen sie.
 import torch
+
 if not torch.cuda.is_available():
     torch.set_num_threads(4)
     torch.set_num_interop_threads(4)
 
 from .md import RampConfig
-from .pipeline import PipelineConfig, run_pipeline, ingest_phase
-
+from .pipeline import PipelineConfig, ingest_phase, run_pipeline
 
 # ── Argument-Parser ─────────────────────────────────────────────────────────
 
@@ -128,9 +128,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # ── Process-Modus ──
     p.add_argument("--mlip", choices=["mace", "chgnet"], default="mace")
     p.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
-    p.add_argument("--t-max", type=float, default=600.0)
+    p.add_argument("--t-max", type=float, default=1200.0,
+                   help="Maximaltemperatur in K (Default: 1200)")
     p.add_argument("--delta-t", type=float, default=10.0)
-    p.add_argument("--therm-steps", type=int, default=100)
+    p.add_argument("--therm-steps", type=int, default=500,
+                   help="Thermalisierungs-Schritte pro T-Stufe (Default: 500)")
     p.add_argument("--duration-min", type=int, default=25,
                    help="Max. Laufzeit in Minuten (SLURM Time-Out-Handling, Default: 25)")
     p.add_argument("--stale-minutes", type=int, default=30,
@@ -141,6 +143,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Queue-Statistik anzeigen und beenden")
     p.add_argument("--reset-stale", action="store_true",
                    help="Stale 'processing'-Einträge zurück auf 'pending' setzen")
+    p.add_argument("--resimulate", nargs="+", default=None,
+                   help="Material-IDs (mp-xxxx) erneut simulieren: 'done' → 'pending' in Queue")
 
     return p.parse_args(argv)
 
@@ -148,7 +152,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ── Analyse-Modus ───────────────────────────────────────────────────────────
 
 def _run_analyze(args: argparse.Namespace) -> int:
-    from .analyze import analyze_material, analyze_all, rank_materials
+    from .analyze import analyze_all, analyze_material, rank_materials
 
     if args.rank:
         rank_materials(
@@ -256,6 +260,21 @@ def _run_reset_stale(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_resimulate(args: argparse.Namespace) -> int:
+    """Materialien für erneute Simulation zurück in die Queue stellen.
+
+    Setzt den Status in der ``structures``-Tabelle von 'done' auf 'pending'
+    und löscht ggf. vorhandene Ergebnisse aus der ``materials``-Tabelle.
+    """
+    from .storage import requeue_materials
+
+    material_ids = args.resimulate or []
+    n = requeue_materials(args.db, material_ids)
+    print(f"{n} Materialien zurück in die Queue gestellt (status → pending).")
+    print(f"Starte Pipeline mit: python -m mat_sim.run --db {args.db} --device auto")
+    return 0
+
+
 # ── Recheck-Switch ─────────────────────────────────────────────────────────
 
 def _run_recheck_switch(args: argparse.Namespace) -> int:
@@ -267,8 +286,8 @@ def _run_recheck_switch(args: argparse.Namespace) -> int:
     2. **Ohne RDF-History** (alte DB-Einträge): Fallback über
        ``detect_t_switch_from_scalars()`` — nutzt Volumen- und Q4-Zeitreihen.
     """
-    from .storage import list_material_ids, load_result, update_t_switch
     from .metrics import detect_t_switch, detect_t_switch_from_scalars
+    from .storage import list_material_ids, load_result, update_t_switch
 
     ids = list_material_ids(args.db)
     if not ids:
@@ -358,6 +377,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_queue_stats(args)
     if args.reset_stale:
         return _run_reset_stale(args)
+    if args.resimulate:
+        return _run_resimulate(args)
     if args.recheck_switch:
         return _run_recheck_switch(args)
     if args.ingest:
