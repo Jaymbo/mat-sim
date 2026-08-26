@@ -672,6 +672,28 @@ def mark_structure_error(db_path: str | Path, material_id: str) -> None:
         conn.close()
 
 
+def requeue_structure(db_path: str | Path, material_id: str) -> None:
+    """Struktur nach SLURM-Time-Out zurück auf 'pending' setzen.
+
+    Anders als ``mark_structure_done`` wird die Struktur wieder claimbar,
+    damit der nächste Job sie mit Checkpoint-Priorisierung fortsetzt.
+    Der Checkpoint bleibt erhalten.
+    """
+    conn = init_db(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE structures
+            SET status = 'pending', claimed_by = NULL, claimed_at = NULL
+            WHERE material_id = ?
+            """,
+            (material_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def reset_stale(
     db_path: str | Path,
     stale_minutes: int = 30,

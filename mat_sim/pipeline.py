@@ -50,6 +50,7 @@ from .storage import (
     mark_structure_done,
     mark_structure_error,
     queue_stats,
+    requeue_structure,
     reset_stale,
     save_checkpoint,
     store_result,
@@ -215,14 +216,22 @@ def run_pipeline(cfg: PipelineConfig) -> int:
 
         # MD-Simulation
         deadline = time.perf_counter() + _time_remaining() - _TIMEOUT_BUFFER_S
-        _process_single(
+        completed = _process_single(
             entry, atoms, calc, cfg.ramp, conn,
             db_path=cfg.db_path,
             material_id=queued.material_id,
             deadline=deadline,
         )
-        mark_structure_done(cfg.db_path, queued.material_id)
-        processed += 1
+        if completed:
+            mark_structure_done(cfg.db_path, queued.material_id)
+            processed += 1
+        else:
+            # Time-Out: Struktur zurück auf 'pending' für Resume im nächsten Job
+            requeue_structure(cfg.db_path, queued.material_id)
+            logger.info(
+                "%s timed_out → zurück auf 'pending' (Checkpoint vorhanden).",
+                queued.material_id,
+            )
 
         stats = queue_stats(cfg.db_path)
         logger.info(
@@ -312,12 +321,18 @@ def _process_single(
     db_path: str,
     material_id: str,
     deadline: float | None = None,
-) -> None:
+) -> bool:
     """Eine einzelne Struktur durch die Rampen-Engine schicken.
 
     Unterstützt Checkpoint/Resume: lädt vorhandenen Checkpoint, stellt
     Atompositionen/Zelle/Metriken wieder her und übergibt eine Deadline
     für sauberes Time-Out-Handling.
+
+    Returns
+    -------
+    bool
+        *True* wenn die Simulation vollständig abgeschlossen wurde,
+        *False* bei Time-Out (Checkpoint wurde gespeichert).
     """
     atoms.calc = calc
 
@@ -365,6 +380,14 @@ def _process_single(
         result = TrajectoryResult(status="diverged")
         snapshots = {}
 
+    # ── Bei Time-Out: nicht in materials speichern, nur Checkpoint behalten ──
+    if result.status == "timed_out":
+        logger.info(
+            "%s timed_out — Checkpoint gespeichert, kein Ergebnis-Eintrag.",
+            entry.material_id,
+        )
+        return False
+
     # ── Ergebnis speichern ───────────────────────────────────────────
     store_result(conn, entry, result, snapshots)
     logger.info(
@@ -375,8 +398,8 @@ def _process_single(
         result.t_decay,
     )
 
-    # ── Checkpoint aufräumen (nur bei vollständiger Fertigstellung) ──
-    if result.status != "timed_out":
-        delete_checkpoint(db_path, material_id)
-        logger.info("Checkpoint für %s gelöscht (Simulation abgeschlossen).",
-                     material_id)
+    # ── Checkpoint aufräumen (Simulation vollständig abgeschlossen) ──
+    delete_checkpoint(db_path, material_id)
+    logger.info("Checkpoint für %s gelöscht (Simulation abgeschlossen).",
+                 material_id)
+    return True

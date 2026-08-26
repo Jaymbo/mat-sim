@@ -19,6 +19,7 @@ from mat_sim.storage import (
     ingest_structures,
     init_db,
     load_checkpoint,
+    requeue_structure,
     save_checkpoint,
 )
 
@@ -212,3 +213,77 @@ def test_claim_without_checkpoint(tmp_db: str) -> None:
     claimed = claim_next_structure(tmp_db, "worker-1")
     assert claimed is not None
     assert claimed.material_id == "mp-A"  # alphabetisch zuerst
+
+
+# ── Tests: requeue_structure ────────────────────────────────────────────────
+
+def test_requeue_structure_after_timeout(tmp_db: str) -> None:
+    """Nach Time-Out: processing → pending, Checkpoint bleibt erhalten."""
+    from pymatgen.core import Lattice, Structure
+
+    from mat_sim.storage import queue_stats
+
+    struct = Structure(Lattice.cubic(5.0), ["O", "O"], [[0, 0, 0], [0.5, 0.5, 0.5]])
+    entries = [
+        MPEntry(material_id="mp-X", formula_pretty="O2", structure=struct),
+    ]
+    ingest_structures(tmp_db, entries, "O")
+
+    # Claimen (status → processing)
+    claimed = claim_next_structure(tmp_db, "worker-1")
+    assert claimed is not None
+    assert claimed.material_id == "mp-X"
+
+    # Checkpoint speichern
+    positions = np.zeros((2, 3))
+    cell = np.eye(3) * 5.0
+    metrics = _serialize_result(_make_result(3))
+    save_checkpoint(tmp_db, "mp-X", 2, 20.0, positions, cell, metrics)
+
+    # Time-Out: requeue_structure statt mark_structure_done
+    requeue_structure(tmp_db, "mp-X")
+
+    # Struktur sollte wieder pending sein
+    stats = queue_stats(tmp_db)
+    assert stats["pending"] == 1
+    assert stats["processing"] == 0
+
+    # Checkpoint sollte noch existieren
+    assert has_checkpoint(tmp_db, "mp-X")
+
+    # Nächster Job claimt sie wieder (mit Checkpoint-Priorität)
+    claimed2 = claim_next_structure(tmp_db, "worker-2")
+    assert claimed2 is not None
+    assert claimed2.material_id == "mp-X"
+
+
+def test_requeue_vs_done_difference(tmp_db: str) -> None:
+    """requeue_structure macht claimbar; mark_structure_done nicht."""
+    from pymatgen.core import Lattice, Structure
+
+    from mat_sim.storage import mark_structure_done
+
+    struct = Structure(Lattice.cubic(5.0), ["O", "O"], [[0, 0, 0], [0.5, 0.5, 0.5]])
+    entries = [
+        MPEntry(material_id="mp-D", formula_pretty="O2", structure=struct),
+        MPEntry(material_id="mp-R", formula_pretty="O2", structure=struct),
+    ]
+    ingest_structures(tmp_db, entries, "O")
+
+    # mp-D: normal done
+    claimed_d = claim_next_structure(tmp_db, "w1")
+    assert claimed_d.material_id == "mp-D"
+    mark_structure_done(tmp_db, "mp-D")
+
+    # mp-R: timed out → requeued
+    claimed_r = claim_next_structure(tmp_db, "w2")
+    assert claimed_r.material_id == "mp-R"
+    requeue_structure(tmp_db, "mp-R")
+
+    # mp-R should be claimable again, mp-D should not
+    claimed_again = claim_next_structure(tmp_db, "w3")
+    assert claimed_again is not None
+    assert claimed_again.material_id == "mp-R"
+
+    # No more pending
+    assert claim_next_structure(tmp_db, "w4") is None
