@@ -144,6 +144,21 @@ def init_db(db_path: str | Path) -> sqlite3.Connection:
             archived_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Schema-Migration für materials_archive (falls Tabelle mit altem Schema existiert)
+    _migrate_columns(conn, "materials_archive", {
+        "structure_before_json": "TEXT",
+        "structure_after_json": "TEXT",
+        "rdf_history_json": "TEXT",
+        "cooling_score": "REAL",
+        "heating_score": "REAL",
+        "total_score": "REAL",
+        "contrast_score": "REAL",
+        "optical_evaluated": "TIMESTAMP",
+        "positions_history_json": "TEXT",
+        "cell_history_json": "TEXT",
+        "symbols_json": "TEXT",
+    })
+
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_materials_archive_mid
         ON materials_archive(material_id)
