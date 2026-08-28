@@ -27,6 +27,7 @@ from .metrics import (
     compute_msd,
     compute_rdf,
     compute_steinhardt_q4,
+    compute_vibrational_msd,
     detect_t_decay,
     detect_t_switch,
     nearest_neighbor_distance,
@@ -109,6 +110,42 @@ class _EquilibriumMonitor:
             raise _EquilibriumStop
 
 
+# ── Position Collector (ASE-Callback) ──────────────────────────────────────
+class _PositionCollector:
+    """Sammelt Positionssnapshots während der Thermalisierung für vibrational MSD.
+
+    Wird als Callback an das ASE-Dynamics-Objekt angehängt und sammelt alle
+    ``sample_interval`` Schritte eine Kopie der Atompositionen.  Die
+    gesammelten Positionen werden zur Berechnung der vibrational MSD verwendet
+    (Schwingungsamplitude um die Gleichgewichtsposition, nicht um 0 K-Positionen).
+
+    Vor jeder Temperaturstufe muss :meth:`reset` aufgerufen werden.
+    """
+
+    def __init__(self, atoms: Atoms, sample_interval: int = 10) -> None:
+        self._atoms = atoms
+        self._sample_interval = max(sample_interval, 1)
+        self._step_count = 0
+        self._samples: list[np.ndarray] = []
+
+    def reset(self) -> None:
+        """Samples für eine neue Temperaturstufe zurücksetzen."""
+        self._step_count = 0
+        self._samples.clear()
+
+    @property
+    def samples(self) -> np.ndarray | None:
+        """Array der Form ``(n_samples, N, 3)`` oder *None* wenn keine Samples."""
+        if not self._samples:
+            return None
+        return np.array(self._samples)
+
+    def __call__(self) -> None:
+        self._step_count += 1
+        if self._step_count % self._sample_interval == 0:
+            self._samples.append(self._atoms.get_positions().copy())
+
+
 # ── Konfiguration ───────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class RampConfig:
@@ -137,6 +174,8 @@ class RampConfig:
     early_stop_min_steps: int = 20      # Mindestschritte, bevor Abbruch geprüft wird
     early_stop_window: int = 10         # Grösse des rotierenden Fensters
     early_stop_rel_std: float = 0.02    # rel. Std-Abw.-Schwelle (2 %)
+    # MSD-Sampling (vibrational MSD um Gleichgewichtsposition, nicht 0 K)
+    msd_sample_interval: int = 10       # alle N MD-Schritte Positionen sampeln
 
 
 # ── Rampen-Engine ───────────────────────────────────────────────────────────
@@ -237,6 +276,10 @@ class ThermalRamp:
         monitor = _EquilibriumMonitor(dyn, cfg)
         dyn.attach(monitor, interval=1)
 
+        # Position-Collector für vibrational MSD
+        pos_collector = _PositionCollector(self.atoms, cfg.msd_sample_interval)
+        dyn.attach(pos_collector, interval=1)
+
         temperatures = np.arange(
             cfg.t_start, cfg.t_max + cfg.delta_t, cfg.delta_t
         )
@@ -265,6 +308,7 @@ class ThermalRamp:
 
             # Thermalisieren (mit Profiling + Early Stopping)
             monitor.reset()
+            pos_collector.reset()
             t0 = time.perf_counter()
             early_stopped = False
             try:
@@ -290,7 +334,7 @@ class ThermalRamp:
                 break
 
             # Metriken sammeln
-            metrics = self._collect_metrics(T, initial_positions)
+            metrics = self._collect_metrics(T, initial_positions, pos_collector.samples)
             result.add(metrics)
 
             print(f"   [ERFOLG] T = {T:.1f} K nach {elapsed:.2f} Sekunden beendet. "
@@ -379,15 +423,31 @@ class ThermalRamp:
         self,
         temperature: float,
         initial_positions: np.ndarray,
+        positions_samples: np.ndarray | None = None,
     ) -> StepMetrics:
-        """Alle Metriken für den aktuellen Snapshot erfassen."""
+        """Alle Metriken für den aktuellen Snapshot erfassen.
+
+        Parameters
+        ----------
+        positions_samples
+            Gesammelte Positionssnapshots aus der Thermalisierungsphase
+            (Form ``(n_samples, N, 3)``).  Wenn vorhanden, wird die
+            vibrational MSD (Schwingungsamplitude um die Gleichgewichtsposition)
+            berechnet.  Andernfalls wird auf die alte drift-behaftete MSD
+            gegen die 0 K-Positionen zurückgegriffen.
+        """
         atoms = self.atoms
         r, g = compute_rdf(
             atoms,
             r_max=self.cfg.rdf_r_max,
             n_bins=self.cfg.rdf_n_bins,
         )
-        msd = compute_msd(initial_positions, atoms.get_positions())
+        # Vibrational MSD (um Gleichgewichtsposition) bevorzugen,
+        # falls Positionssamples vorhanden sind.
+        if positions_samples is not None and positions_samples.shape[0] >= 2:
+            msd = compute_vibrational_msd(positions_samples)
+        else:
+            msd = compute_msd(initial_positions, atoms.get_positions())
         ql = compute_steinhardt_q4(atoms)
 
         return StepMetrics(

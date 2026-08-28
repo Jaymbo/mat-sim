@@ -92,6 +92,39 @@ def compute_msd(initial_positions: np.ndarray, current_positions: np.ndarray) ->
     return float(np.mean(np.sum(disp**2, axis=1)))
 
 
+# ── Vibrational MSD ────────────────────────────────────────────────────────
+def compute_vibrational_msd(positions_samples: np.ndarray) -> float:
+    """Vibrational MSD: mittlere quadratische Auslenkung um die Gleichgewichtsposition.
+
+    Misst die thermische Schwingungsamplitude der Atome um ihre mittlere
+    Position während der Thermalisierung.  Im Gegensatz zu
+    :func:`compute_msd` wird nicht gegen die 0 K-Position verglichen,
+    sondern gegen den Mittelwert der gesampleten Positionen.  Dadurch wird
+    strukturelle Relaxation (Drift) nicht als Schwingung fehlinterpretiert.
+
+    Dies ist die korrekte Größe für das Lindemann-Kriterium: nur wenn die
+    *Vibrationsamplitude* den Schwellwert überschreitet, liegt Schmelzen vor.
+
+    Parameters
+    ----------
+    positions_samples
+        Array der Form ``(n_samples, N, 3)`` mit Positionssnapshots aus
+        der Thermalisierungsphase.
+
+    Returns
+    -------
+    float
+        Vibrational MSD in Å².  Bei weniger als 2 Samples wird 0.0
+        zurückgegeben (keine aussagekräftige Statistik möglich).
+    """
+    if positions_samples is None or positions_samples.shape[0] < 2:
+        return 0.0
+
+    mean_pos = np.mean(positions_samples, axis=0)  # (N, 3)
+    disp = positions_samples - mean_pos            # (n_samples, N, 3)
+    return float(np.mean(np.sum(disp**2, axis=2)))
+
+
 # ── RDF ────────────────────────────────────────────────────────────────────
 def compute_rdf(
     atoms: Atoms,
