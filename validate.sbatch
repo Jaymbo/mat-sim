@@ -36,7 +36,7 @@ echo ""
 echo "[$(date)] Schritt 1: Archiviere alte Ergebnisse …"
 uv run python -m mat_sim.run \
     --resimulate mp-18248 mp-19227 mp-20406 \
-    --version-label v1 \
+    --version-label v4 \
     --db results.db
 
 echo ""
@@ -67,20 +67,20 @@ fi
 # ── Schritt 3: Ergebnisse anzeigen ──────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════════════════════"
-echo "  Validierung: alt (v1) vs. neu (v2)"
+echo "  Validierung: alt (v4) vs. neu (mit Persistenz + MSD-basiertem T_switch)"
 echo "══════════════════════════════════════════════════════════════════"
 echo ""
 
-echo "── Archivierte v1-Ergebnisse ──"
+echo "── Archivierte v4-Ergebnisse (vorheriger Lauf) ──"
 sqlite3 results.db "
 SELECT material_id, formula, t_switch, t_decay
 FROM materials_archive
-WHERE version_label = 'v1'
+WHERE version_label = 'v4'
 ORDER BY material_id;
 "
 
 echo ""
-echo "── Neue v2-Ergebnisse ──"
+echo "── Neue Ergebnisse (mit Persistenz + MSD-basiertem T_switch) ──"
 sqlite3 results.db "
 SELECT material_id, formula, t_switch, t_decay, status
 FROM materials
@@ -90,9 +90,9 @@ ORDER BY material_id;
 
 echo ""
 echo "── Literatur-Vergleich ──"
-echo "  mp-18248 (VO2):     v1=? → v2=? | Literatur: ~340 K"
-echo "  mp-19227 (YMnO3):   v1=? → v2=? | Literatur: ~900 K"
-echo "  mp-20406 (Lu2V2O7): v1=? → v2=? | Literatur: ~130 K (Pyrochlore)"
+echo "  mp-18248 (VO2):     v4=? → neu=? | Literatur: ~340 K"
+echo "  mp-19227 (YMnO3):   v4=? → neu=? | Literatur: ~900 K"
+echo "  mp-20406 (Lu2V2O7): v4=? → neu=? | Literatur: ~130 K (Pyrochlore)"
 
 echo ""
 echo "[$(date)] Validierung abgeschlossen."

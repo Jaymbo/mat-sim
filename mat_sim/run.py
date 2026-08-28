@@ -14,7 +14,7 @@ Zwei-Phasen-Workflow
 Allgemeine Beispiele
 ---------------------
 Pipeline starten (Ingest + Process in einem Schritt):
-    python -m mat_sim.run --chemsys V-O Ti-O --t-max 600 --delta-t 10
+    python -m mat_sim.run --chemsys V-O Ti-O --t-max 600 --delta-t 20
 
 Einzelnes Material analysieren (Dashboard + Vor-Evaluierung):
     python -m mat_sim.run --analyze --material-id mp-1234 --db results.db
@@ -44,7 +44,7 @@ Optionen (Ingest)
 Optionen (Process)
     --device          cpu | cuda | auto  (Default: cpu)
     --t-max           Maximaltemperatur in K          (Default: 1200)
-    --delta-t         Temperaturschritt in K          (Default: 10)
+    --delta-t         Temperaturschritt in K          (Default: 20)
     --therm-steps     Thermalisierungs-Schritte pro T (Default: 500)
     --duration-min    Max. Laufzeit in Minuten (SLURM) (Default: 25)
     --stale-minutes   processing-Timeout für Reset    (Default: 30)
@@ -134,7 +134,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
     p.add_argument("--t-max", type=float, default=1200.0,
                    help="Maximaltemperatur in K (Default: 1200)")
-    p.add_argument("--delta-t", type=float, default=10.0)
+    p.add_argument("--delta-t", type=float, default=20.0)
     p.add_argument("--therm-steps", type=int, default=500,
                    help="Thermalisierungs-Schritte pro T-Stufe (Default: 500)")
     p.add_argument("--duration-min", type=int, default=25,
