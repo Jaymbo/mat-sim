@@ -491,6 +491,8 @@ def detect_t_switch_from_msd(
     baseline_window: int = 3,
     min_persistence: int = 3,
     suddenness_factor: float = 3.0,
+    min_absolute_msd: float = 0.001,
+    min_temperature: float = 100.0,
 ) -> float | None:
     """T_switch aus dauerhafter MSD-Basislinien-Verschiebung ableiten.
 
@@ -508,6 +510,11 @@ def detect_t_switch_from_msd(
     3. **Persistenz**: Die Post-Baseline (Mittelwert der folgenden
        ``min_persistence`` Schritte, ohne ``idx`` selbst) muss ebenfalls
        um mindestens ``shift_factor`` verschoben sein.
+    4. **Absolute Schwelle**: Die Pre-Baseline-MSD muss ≥ ``min_absolute_msd``
+       sein.  Verhindert falsche Detektion beim Übergang von eingefrorenen
+       Atomen (MSD ≈ 0) zu kleiner thermischer Vibration (Einschwingen).
+    5. **Mindesttemperatur**: Die Temperatur am Kandidaten muss ≥
+       ``min_temperature`` sein.  Verhindert Tieftemperatur-Artefakte.
 
     Parameters
     ----------
@@ -525,6 +532,14 @@ def detect_t_switch_from_msd(
     suddenness_factor
         Die Schritt-zu-Schritt-Änderung muss mindestens diesen Faktor
         mal der typischen Pre-Baseline-Variation entsprechen (Default: 3.0).
+    min_absolute_msd
+        Mindest-MSD der Pre-Baseline in Å² (Default: 0.001).
+        Wenn die Atome noch kaum schwingen (MSD < Schwelle), ist eine
+        scheinbare Verschiebung nur das Einsetzen thermischer Bewegung,
+        kein Phasenübergang.
+    min_temperature
+        Mindesttemperatur in K für T_switch (Default: 100.0).
+        Unterhalb dieser Temperatur werden keine Phasenübergänge detektiert.
 
     Returns
     -------
@@ -536,10 +551,19 @@ def detect_t_switch_from_msd(
         return None
 
     msds = np.asarray(msd_values, dtype=float)
+    temps = np.asarray(temperatures, dtype=float)
 
     for idx in range(baseline_window, n - min_persistence):
+        # 5. Mindesttemperatur: Tieftemperatur-Artefakte ausschließen
+        if temps[idx] < min_temperature:
+            continue
+
         pre = np.mean(msds[idx - baseline_window:idx])
         if pre < 1e-10:
+            continue
+
+        # 4. Absolute Schwelle: Pre-Baseline muss signifikante Vibration zeigen
+        if pre < min_absolute_msd:
             continue
 
         curr = msds[idx]

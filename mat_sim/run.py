@@ -346,6 +346,8 @@ def _run_recheck_switch(args: argparse.Namespace) -> int:
             new_t = detect_t_switch_from_msd(
                 mat.msd_values,
                 mat.temperatures,
+                min_absolute_msd=0.001,
+                min_temperature=100.0,
             )
             if new_t is not None:
                 n_msd_based += 1

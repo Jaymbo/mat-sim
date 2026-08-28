@@ -123,7 +123,8 @@ def test_first_possible_step() -> None:
         msd[i] = 0.04 + 0.001 * (i - 3)
     temps = _temps(len(msd))
 
-    t = detect_t_switch_from_msd(msd, temps, baseline_window=3, min_persistence=3)
+    t = detect_t_switch_from_msd(msd, temps, baseline_window=3, min_persistence=3,
+                                 min_temperature=0.0)
     assert t is not None
     assert t == 60.0
 
@@ -166,4 +167,68 @@ def test_oscillating_msd_no_switch() -> None:
     temps = _temps(len(msd))
 
     t = detect_t_switch_from_msd(msd, temps)
+    assert t is None
+
+
+# ── Tests: Absolute Schwelle & Mindesttemperatur ───────────────────────────
+
+def test_low_absolute_msd_filtered() -> None:
+    """Pre-Baseline MSD unter min_absolute_msd → kein T_switch.
+
+    Simuliert den Übergang von eingefrorenen Atomen (MSD ≈ 0) zu kleiner
+    thermischer Vibration.  Das ist kein Phasenübergang, nur das Einsetzen
+    thermischer Bewegung.
+    """
+    # MSD steigt von 0.0001 (eingefroren) auf 0.001 (Vibration) bei Schritt 10
+    msd = [0.0001 + 0.00001 * i for i in range(10)]
+    msd += [0.001 + 0.0001 * (i - 10) for i in range(10, 20)]
+    temps = _temps(len(msd))
+
+    # Default min_absolute_msd=0.001 → pre-baseline ≈ 0.0001 < 0.001 → None
+    t = detect_t_switch_from_msd(msd, temps)
+    assert t is None
+
+
+def test_low_absolute_msd_detected_with_lower_threshold() -> None:
+    """Mit min_absolute_msd=0.0001 wird derselbe Sprung erkannt."""
+    msd = [0.0001 + 0.00001 * i for i in range(10)]
+    msd += [0.001 + 0.0001 * (i - 10) for i in range(10, 20)]
+    temps = _temps(len(msd))
+
+    t = detect_t_switch_from_msd(msd, temps, min_absolute_msd=0.00001)
+    assert t is not None
+    assert t == 200.0
+
+
+def test_min_temperature_filters_low_t() -> None:
+    """Sprung bei T < min_temperature → verworfen."""
+    msd = _smooth_msd(n=20, base=0.01, drift=0.0005)
+    # Sprung bei Schritt 3 (T=60K) — unter Default min_temperature=100K
+    for i in range(3, 20):
+        msd[i] = 0.04 + 0.001 * (i - 3)
+    temps = _temps(len(msd))
+
+    # Default min_temperature=100 → T=60K wird übersprungen
+    t = detect_t_switch_from_msd(msd, temps, min_temperature=100.0)
+    assert t is None
+
+    # Mit min_temperature=0 → T=60K wird erkannt
+    t = detect_t_switch_from_msd(msd, temps, min_temperature=0.0)
+    assert t is not None
+    assert t == 60.0
+
+
+def test_realistic_vo2_like_data_no_switch() -> None:
+    """VO₂-ähnliche Daten: glatte MSD-Kurve mit sehr kleinen Werten → None.
+
+    Reproduziert das Artefakt aus der lokalen DB: MSD steigt glatt von
+    ~0.00002 auf ~0.00017 Å² (500× unter Lindemann-Threshold).
+    Ohne min_absolute_msd würde der Algorithmus fälschlich T_switch detektieren.
+    """
+    # VO₂ (mp-541404) Daten nachempfunden
+    temps = [0, 50, 100, 150, 200, 250, 300, 350, 400]
+    msd = [0.000018, 0.000028, 0.000039, 0.000052, 0.000068,
+           0.000085, 0.000108, 0.000136, 0.000172]
+
+    t = detect_t_switch_from_msd(msd, temps, baseline_window=3, min_persistence=2)
     assert t is None

@@ -408,6 +408,8 @@ class ThermalRamp:
                 result.t_switch = detect_t_switch_from_msd(
                     result.msd_values,
                     result.temperatures,
+                    min_absolute_msd=0.001,
+                    min_temperature=100.0,
                 )
             # T_decay: nur wenn nicht schon inline detektiert
             if result.t_decay is None and len(result.msd_values) >= 1:
