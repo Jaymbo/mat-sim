@@ -31,13 +31,22 @@ echo "  GPU:           $CUDA_VISIBLE_DEVICES"
 echo ""
 
 # ── Schritt 1: 3 Test-Materialien archivieren + re-queue ───────────────────
-# Immer ausführen: requeue_materials löscht alte Checkpoints, so dass
-# die Simulation frisch startet (kein Resume von veralteten Checkpoints).
-echo "[$(date)] Schritt 1: Archiviere alte Ergebnisse …"
-uv run python -m mat_sim.run \
-    --resimulate mp-18248 mp-19227 mp-20406 \
-    --version-label v4 \
-    --db results.db
+# NUR beim ersten Lauf (keine Checkpoints vorhanden): requeue + archivieren.
+# Bei Rescheduling (Checkpoints vorhanden) überspringen → Pipeline resumed.
+HAS_CKPT=$(sqlite3 results.db "
+SELECT COUNT(*) FROM checkpoints
+WHERE material_id IN ('mp-18248', 'mp-19227', 'mp-20406');
+")
+
+if [ "$HAS_CKPT" -eq 0 ]; then
+    echo "[$(date)] Schritt 1: Archiviere alte Ergebnisse (erster Lauf) …"
+    uv run python -m mat_sim.run \
+        --resimulate mp-18248 mp-19227 mp-20406 \
+        --version-label v4 \
+        --db results.db
+else
+    echo "[$(date)] Schritt 1 übersprungen — Checkpoints vorhanden, Resume-Modus."
+fi
 
 echo ""
 
