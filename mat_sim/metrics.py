@@ -446,8 +446,14 @@ def detect_t_decay(
     temperatures: Sequence[float],
     nn_distance: float,
     lindemann_fraction: float = 0.12,
+    min_persistence: int = 2,
 ) -> float | None:
     """T_decay via Lindemann-Kriterium: MSD > lindemann_fraction * d_NN².
+
+    Die MSD muss den Schwellwert für mindestens ``min_persistence``
+    aufeinanderfolgende Schritte überschreiten, bevor Zerfall angenommen
+    wird.  Transiente Spikes (ein einzelner hoher MSD-Wert, der sofort
+    wieder abklingt) werden dadurch verworfen.
 
     Parameters
     ----------
@@ -455,9 +461,107 @@ def detect_t_decay(
         Nächste-Nachbar-Abstand bei T ≈ 0 (Å).
     lindemann_fraction
         Schwellwert (typisch 0.10–0.15).
+    min_persistence
+        Anzahl aufeinanderfolgender Schritte über dem Schwellwert,
+        die erforderlich sind, bevor T_decay zurückgegeben wird (Default: 2).
+        Bei ``min_persistence=1`` verhält sich die Funktion wie ohne
+        Persistenz-Check (sofortiger Abbruch beim ersten Überschreiten).
     """
     threshold = (lindemann_fraction * nn_distance) ** 2
+    consecutive = 0
+    decay_temp: float | None = None
     for msd, temp in zip(msd_values, temperatures):
         if msd > threshold:
-            return float(temp)
+            if consecutive == 0:
+                decay_temp = float(temp)
+            consecutive += 1
+            if consecutive >= min_persistence:
+                return decay_temp
+        else:
+            consecutive = 0
+            decay_temp = None
+    return None
+
+
+# ── Phasenwechsel-Erkennung aus MSD ────────────────────────────────────────
+def detect_t_switch_from_msd(
+    msd_values: Sequence[float],
+    temperatures: Sequence[float],
+    shift_factor: float = 2.0,
+    baseline_window: int = 3,
+    min_persistence: int = 3,
+    suddenness_factor: float = 3.0,
+) -> float | None:
+    """T_switch aus dauerhafter MSD-Basislinien-Verschiebung ableiten.
+
+    Ein Phasenwechsel wird detektiert, wenn die MSD sich **sprunghaft**
+    und **dauerhaft** auf ein neues Niveau verschiebt.  Transiente Spikes
+    (MSD kehrt zum alten Niveau zurück) werden verworfen.
+
+    Detektionskriterien (alle müssen erfüllt sein):
+
+    1. **Plötzlichkeit**: Die Schritt-zu-Schritt-Änderung an der Position
+       ``idx`` muss deutlich größer sein als die typische Variation im
+       Pre-Baseline-Fenster (``suddenness_factor``×).
+    2. **Signifikanz**: Die MSD an Position ``idx`` muss sich um mindestens
+       ``shift_factor`` von der Pre-Baseline unterscheiden.
+    3. **Persistenz**: Die Post-Baseline (Mittelwert der folgenden
+       ``min_persistence`` Schritte, ohne ``idx`` selbst) muss ebenfalls
+       um mindestens ``shift_factor`` verschoben sein.
+
+    Parameters
+    ----------
+    msd_values
+        MSD-Zeitreihe (Å²), eine pro Temperaturschritt.
+    temperatures
+        Temperaturwerte (K), eine pro Schritt.
+    shift_factor
+        Mindestfaktor der Basislinien-Verschiebung (Default: 2.0).
+        Neue Basislinie muss ≥ 2× oder ≤ 0.5× der alten sein.
+    baseline_window
+        Anzahl der Schritte vor dem Kandidaten für die Pre-Baseline (Default: 3).
+    min_persistence
+        Anzahl der Schritte nach dem Kandidaten für die Post-Baseline (Default: 3).
+    suddenness_factor
+        Die Schritt-zu-Schritt-Änderung muss mindestens diesen Faktor
+        mal der typischen Pre-Baseline-Variation entsprechen (Default: 3.0).
+
+    Returns
+    -------
+    float | None
+        Temperatur des ersten detektierten Sprungs oder *None*.
+    """
+    n = len(msd_values)
+    if n < baseline_window + 1 + min_persistence:
+        return None
+
+    msds = np.asarray(msd_values, dtype=float)
+
+    for idx in range(baseline_window, n - min_persistence):
+        pre = np.mean(msds[idx - baseline_window:idx])
+        if pre < 1e-10:
+            continue
+
+        curr = msds[idx]
+
+        # 1. Plötzlichkeit: Schritt-zu-Schritt-Änderung >> typische Variation davor
+        pre_diffs = np.abs(np.diff(msds[idx - baseline_window:idx]))
+        typical_diff = float(np.mean(pre_diffs)) if pre_diffs.size else 0.0
+        step_diff = abs(curr - msds[idx - 1])
+        if step_diff < suddenness_factor * (typical_diff + 1e-12):
+            continue
+
+        # 2. Signifikanz: aktueller Wert muss deutlich von Pre-Baseline abweichen
+        curr_ratio = curr / pre
+        if shift_factor > curr_ratio > 1.0 / shift_factor:
+            continue
+
+        # 3. Persistenz: Post-Baseline muss ebenfalls verschoben sein
+        post = np.mean(msds[idx + 1:idx + 1 + min_persistence])
+        post_ratio = post / pre
+        if shift_factor > post_ratio > 1.0 / shift_factor:
+            continue
+
+        return float(temperatures[idx])
+
     return None

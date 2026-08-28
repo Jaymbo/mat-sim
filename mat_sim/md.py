@@ -30,6 +30,7 @@ from .metrics import (
     compute_vibrational_msd,
     detect_t_decay,
     detect_t_switch,
+    detect_t_switch_from_msd,
     nearest_neighbor_distance,
 )
 
@@ -176,6 +177,10 @@ class RampConfig:
     early_stop_rel_std: float = 0.02    # rel. Std-Abw.-Schwelle (2 %)
     # MSD-Sampling (vibrational MSD um Gleichgewichtsposition, nicht 0 K)
     msd_sample_interval: int = 10       # alle N MD-Schritte Positionen sampeln
+    # Persistenz für Zerfalls-Erkennung (Lindemann): MSD muss für N
+    # aufeinanderfolgende Schritte über dem Schwellwert bleiben, bevor
+    # abgebrochen wird.  Filtert transiente Spikes.
+    decay_persistence: int = 2
 
 
 # ── Rampen-Engine ───────────────────────────────────────────────────────────
@@ -291,6 +296,8 @@ class ThermalRamp:
         # --- Schritt 3: Temperaturschleife --------------------------------
         n_steps_total = len(temperatures)
         timed_out = False
+        decay_consecutive = 0        # aufeinanderfolgende Schritte über Lindemann-Schwelle
+        decay_temp_candidate: float | None = None  # T des ersten Überschreitens
 
         for i, T in enumerate(temperatures):
             global_step = resume_step + 1 + i
@@ -358,35 +365,58 @@ class ThermalRamp:
                 timed_out = True
                 break
 
-            # Frühzeitiger Abbruch bei Zerfall (Lindemann)
-            if (
-                result.t_decay is None
-                and metrics.msd > (cfg.lindemann_fraction * nn_dist) ** 2
-            ):
-                result.t_decay = T
-                result.status = "decayed"
-                # Finaler Checkpoint vor Abbruch
-                if checkpoint_cb is not None and not is_interval_step:
-                    checkpoint_cb(global_step, T, result)
-                logger.warning("Zerfall detektiert bei T=%.1f K – Abbruch.", T)
-                print(f"   [WARNUNG] Zerfall detektiert bei T = {T:.1f} K – Abbruch.",
-                      flush=True)
-                break
+            # Frühzeitiger Abbruch bei Zerfall (Lindemann) mit Persistenz
+            lindemann_threshold = (cfg.lindemann_fraction * nn_dist) ** 2
+            if result.t_decay is None:
+                if metrics.msd > lindemann_threshold:
+                    if decay_consecutive == 0:
+                        decay_temp_candidate = T
+                    decay_consecutive += 1
+                    if decay_consecutive >= cfg.decay_persistence:
+                        result.t_decay = decay_temp_candidate
+                        result.status = "decayed"
+                        if checkpoint_cb is not None and not is_interval_step:
+                            checkpoint_cb(global_step, T, result)
+                        logger.warning(
+                            "Zerfall detektiert bei T=%.1f K "
+                            "(nach %d konsekutiven Schritten) – Abbruch.",
+                            decay_temp_candidate, decay_consecutive,
+                        )
+                        print(
+                            f"   [WARNUNG] Zerfall detektiert bei T = "
+                            f"{decay_temp_candidate:.1f} K "
+                            f"(nach {decay_consecutive} konsekutiven Schritten) "
+                            f"– Abbruch.",
+                            flush=True,
+                        )
+                        break
+                else:
+                    # MSD wieder unter Schwelle → Reset
+                    decay_consecutive = 0
+                    decay_temp_candidate = None
 
         # --- Post-Processing (nur wenn nicht timed_out) -----------------
         if not timed_out:
+            # T_switch: primär RDF-basiert, dann MSD-basiert als Fallback
             if result.t_switch is None and len(result.rdf_history) >= 2:
                 result.t_switch = detect_t_switch(
                     result.rdf_history,
                     result.temperatures,
                     volumes=result.volumes,
                 )
+            if result.t_switch is None and len(result.msd_values) >= 1:
+                result.t_switch = detect_t_switch_from_msd(
+                    result.msd_values,
+                    result.temperatures,
+                )
+            # T_decay: nur wenn nicht schon inline detektiert
             if result.t_decay is None and len(result.msd_values) >= 1:
                 result.t_decay = detect_t_decay(
                     result.msd_values,
                     result.temperatures,
                     nn_distance=nn_dist,
                     lindemann_fraction=cfg.lindemann_fraction,
+                    min_persistence=cfg.decay_persistence,
                 )
 
         logger.info(

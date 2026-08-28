@@ -292,7 +292,11 @@ def _run_recheck_switch(args: argparse.Namespace) -> int:
     2. **Ohne RDF-History** (alte DB-Einträge): Fallback über
        ``detect_t_switch_from_scalars()`` — nutzt Volumen- und Q4-Zeitreihen.
     """
-    from .metrics import detect_t_switch, detect_t_switch_from_scalars
+    from .metrics import (
+        detect_t_switch,
+        detect_t_switch_from_msd,
+        detect_t_switch_from_scalars,
+    )
     from .storage import list_material_ids, load_result, update_t_switch
 
     ids = list_material_ids(args.db)
@@ -306,6 +310,7 @@ def _run_recheck_switch(args: argparse.Namespace) -> int:
     n_lost_switch = 0
     n_rdf_based = 0
     n_scalar_based = 0
+    n_msd_based = 0
     n_no_data = 0
 
     print(f"Re-check T_switch für {n_total} Materialien …")
@@ -336,6 +341,15 @@ def _run_recheck_switch(args: argparse.Namespace) -> int:
             if new_t is not None:
                 n_scalar_based += 1
 
+        # ── Strategie 3: Fallback aus MSD-Zeitreihe ───────────────────
+        if new_t is None and len(mat.msd_values) >= 2:
+            new_t = detect_t_switch_from_msd(
+                mat.msd_values,
+                mat.temperatures,
+            )
+            if new_t is not None:
+                n_msd_based += 1
+
         if new_t is None and (
             len(mat.volumes) < 2 or len(mat.ql_values) < 2
         ) and (mat.rdf_history is None or len(mat.rdf_history) < 2):
@@ -361,6 +375,7 @@ def _run_recheck_switch(args: argparse.Namespace) -> int:
     print(f"  Neue T_switch:      {n_new_switch}")
     print(f"    davon RDF-basiert:    {n_rdf_based}")
     print(f"    davon Skalar-basiert: {n_scalar_based}")
+    print(f"    davon MSD-basiert:    {n_msd_based}")
     print(f"  Verlorene Switches: {n_lost_switch}")
     print(f"  Keine Daten:        {n_no_data}")
     print(f"  → {n_new_switch} gesamt")
