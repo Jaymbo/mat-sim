@@ -954,6 +954,8 @@ def requeue_materials(
             )
             # Alte Ergebnisse aus materials-Tabelle löschen
             conn.execute("DELETE FROM materials WHERE material_id = ?", (mid,))
+            # Alte Checkpoints löschen (neue Simulation startet von vorne)
+            conn.execute("DELETE FROM checkpoints WHERE material_id = ?", (mid,))
             n += cur.rowcount
         conn.commit()
     finally:

@@ -12,11 +12,13 @@ from ase import Atoms
 from mat_sim.acquisition import MPEntry
 from mat_sim.metrics import StepMetrics, TrajectoryResult
 from mat_sim.storage import (
+    has_checkpoint,
     init_db,
     ingest_structures,
     load_result,
     reconstruct_atoms_at_step,
     requeue_materials,
+    save_checkpoint,
     store_result,
 )
 
@@ -368,3 +370,28 @@ def test_requeue_materials_nonexistent(tmp_db: str) -> None:
     """Re-queue eines nicht existierenden Materials: kein Fehler, n=0."""
     n = requeue_materials(tmp_db, ["mp-nonexistent"], version_label="v1")
     assert n == 0
+
+
+def test_requeue_materials_deletes_checkpoint(tmp_db: str) -> None:
+    """requeue_materials löscht alte Checkpoints (neue Simulation startet frisch)."""
+    conn = init_db(tmp_db)
+    entry = _make_entry()
+    result = _make_result(n_steps=3, n_atoms=2)
+
+    ingest_structures(tmp_db, [entry], "O")
+    store_result(conn, entry, result)
+    conn.close()
+
+    # Checkpoint speichern
+    save_checkpoint(
+        tmp_db, "mp-test",
+        step_index=42, temperature=840.0,
+        positions=np.zeros((2, 3)),
+        cell=np.eye(3) * 5.0,
+        metrics="{}",
+    )
+    assert has_checkpoint(tmp_db, "mp-test")
+
+    # Re-queue löscht den Checkpoint
+    requeue_materials(tmp_db, ["mp-test"], version_label="v1")
+    assert not has_checkpoint(tmp_db, "mp-test")

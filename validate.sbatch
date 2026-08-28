@@ -30,24 +30,14 @@ echo "  Partition:     $SLURM_JOB_PARTITION"
 echo "  GPU:           $CUDA_VISIBLE_DEVICES"
 echo ""
 
-# ── Schritt 1: 3 Test-Materialien als v1 archivieren + re-queue ─────────────
-# Nur beim ersten Lauf (kein Checkpoint vorhanden).  Bei Resume wird
-# dieser Schritt übersprungen, da die Materialien bereits gequeued sind.
-VALIDATE_MIDS="mp-18248 mp-19227 mp-20406"
-HAS_CHECKPOINT=$(uv run python -c "
-from mat_sim.storage import has_checkpoint
-print(any(has_checkpoint('results.db', mid) for mid in ${VALIDATE_MIDS}))
-" 2>/dev/null)
-
-if [ "${HAS_CHECKPOINT}" = "False" ]; then
-    echo "[$(date)] Schritt 1: Archiviere alte Ergebnisse als v1 …"
-    uv run python -m mat_sim.run \
-        --resimulate mp-18248 mp-19227 mp-20406 \
-        --version-label v1 \
-        --db results.db
-else
-    echo "[$(date)] Schritt 1 übersprungen — Checkpoint vorhanden, Resume wird fortgesetzt."
-fi
+# ── Schritt 1: 3 Test-Materialien archivieren + re-queue ───────────────────
+# Immer ausführen: requeue_materials löscht alte Checkpoints, so dass
+# die Simulation frisch startet (kein Resume von veralteten Checkpoints).
+echo "[$(date)] Schritt 1: Archiviere alte Ergebnisse …"
+uv run python -m mat_sim.run \
+    --resimulate mp-18248 mp-19227 mp-20406 \
+    --version-label v1 \
+    --db results.db
 
 echo ""
 
