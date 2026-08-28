@@ -253,7 +253,7 @@ def _atoms_to_json(atoms) -> str:
         "symbols": list(atoms.get_chemical_symbols()),
         "positions": atoms.get_positions().tolist(),
         "cell": atoms.get_cell().tolist(),
-        "pbc": list(atoms.get_pbc()),
+        "pbc": [bool(p) for p in atoms.get_pbc()],
         "volume": atoms.get_volume(),
     })
 
