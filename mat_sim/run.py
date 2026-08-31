@@ -145,6 +145,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--supercell-min-atoms", type=int, default=50,
                    help="Mindestatomzahl für Supercell (Default: 50, 0 = keine Supercell)")
 
+    # ── Debug ──
+    p.add_argument("--debug-convergence", action="store_true",
+                   help="Konvergenz-Plots pro T-Schritt speichern (headless PNG)")
+    p.add_argument("--debug-plot-dir", type=str, default="debug_convergence",
+                   help="Verzeichnis für Debug-Plots (Default: debug_convergence)")
+
     # ── Queue-Management ──
     p.add_argument("--queue-stats", action="store_true",
                    help="Queue-Statistik anzeigen und beenden")
@@ -235,6 +241,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         t_max=args.t_max,
         delta_t=args.delta_t,
         thermalization_steps=args.therm_steps,
+        debug_convergence_plots=args.debug_convergence,
+        debug_plot_dir=args.debug_plot_dir,
     )
     cfg = PipelineConfig(
         chemsys_list=args.chemsys or [],

@@ -377,6 +377,7 @@ def _process_single(
             checkpoint_cb=_checkpoint_cb,
             resume_step=resume_step,
             initial_result=initial_result,
+            material_id=material_id,
         )
         snapshots = ramp.snapshots_around_t_switch(result)
     except Exception as exc:  # noqa: BLE001
