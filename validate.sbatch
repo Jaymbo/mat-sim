@@ -31,34 +31,25 @@ echo "  GPU:           $CUDA_VISIBLE_DEVICES"
 echo ""
 
 # ── Schritt 1: 3 Test-Materialien archivieren + re-queue ───────────────────
-# NUR beim ersten Lauf (keine Checkpoints vorhanden): requeue + archivieren.
-# Bei Rescheduling (Checkpoints vorhanden) überspringen → Pipeline resumed.
-HAS_CKPT=$(sqlite3 results.db "
-SELECT COUNT(*) FROM checkpoints
-WHERE material_id IN ('mp-18248', 'mp-19227', 'mp-20406');
-")
-
-if [ "$HAS_CKPT" -eq 0 ]; then
-    echo "[$(date)] Schritt 1: Archiviere alte Ergebnisse (erster Lauf) …"
-    uv run python -m mat_sim.run \
-        --resimulate mp-18248 mp-19227 mp-20406 \
-        --version-label v4 \
-        --db results.db
-else
-    echo "[$(date)] Schritt 1 übersprungen — Checkpoints vorhanden, Resume-Modus."
-fi
+# Validierung: IMMER requeue (frische Simulation mit neuen Parametern).
+# Die Checkpoint-Logik (Resume) ist nur für Produktions-Läufe relevant.
+echo "[$(date)] Schritt 1: Archiviere alte Ergebnisse + re-queue …"
+uv run python -m mat_sim.run \
+    --resimulate mp-18248 mp-19227 mp-20406 \
+    --version-label v4 \
+    --db results.db
 
 echo ""
 
 # ── Schritt 2: Mit neuen Parametern simulieren ─────────────────────────────
-echo "[$(date)] Schritt 2: Simulation (t_max=1200, therm_steps=1000, supercell≥50 Atome, debug-convergence) …"
+echo "[$(date)] Schritt 2: Simulation (t_max=1200, therm_steps=5000, supercell≥50 Atome, debug-convergence) …"
 uv run python -m mat_sim.run \
     --db results.db \
     --device auto \
     --duration-min 25 \
     --t-max 1200 \
     --delta-t 50 \
-    --therm-steps 1000 \
+    --therm-steps 5000 \
     --supercell-min-atoms 50 \
     --debug-convergence
 
