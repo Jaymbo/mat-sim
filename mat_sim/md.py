@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import numpy as np
 from ase import Atoms
 from ase.md.melchionna import MelchionnaNPT as NPT
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
 from ase.optimize import LBFGS
 from ase.units import GPa, fs
 
@@ -768,6 +769,13 @@ class ThermalRamp:
 
             print(f"-> Starte MD-Simulation für T = {T:.1f} K ... "
                   f"(Schritt {global_step}/{resume_step + n_steps_total})", flush=True)
+
+            # Geschwindigkeiten bei Zieltemperatur initialisieren
+            # (Maxwell-Boltzmann + Schwerpunktsbewegung entfernen).
+            # Ohne dies startet die MD bei T≈0 K und der Thermostat
+            # heizt nur extrem langsam auf (τ_T = 200 fs).
+            MaxwellBoltzmannDistribution(self.atoms, temperature_K=T_sim)
+            Stationary(self.atoms)  # COM-Bewegung nullen
 
             # Thermalisieren (mit Profiling + Early Stopping)
             monitor.reset()
