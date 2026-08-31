@@ -24,29 +24,30 @@ from mat_sim.md import (
 
 # ── Hilfs-Fakes ────────────────────────────────────────────────────────────
 class _FakeDyn:
-    """Minimaler ASE-Dynamics-Stub mit setzbarer Temperatur."""
+    """Minimaler ASE-Dynamics-Stub (wird für set_temperature gebraucht)."""
 
     def __init__(self) -> None:
         self._temp = 300.0
-
-    def get_temperature(self) -> float:
-        return self._temp
 
     def set_temperature(self, temperature_K: float) -> None:
         self._temp = temperature_K
 
 
 class _FakeAtoms:
-    """Minimaler Atoms-Stub mit setzbaren Positionen."""
+    """Minimaler Atoms-Stub mit setzbaren Positionen und Temperatur."""
 
     def __init__(self, n_atoms: int = 4) -> None:
         self._positions = np.zeros((n_atoms, 3))
+        self._temp = 300.0
 
     def get_positions(self) -> np.ndarray:
         return self._positions.copy()
 
     def set_positions(self, positions: np.ndarray) -> None:
         self._positions = positions
+
+    def get_temperature(self) -> float:
+        return self._temp
 
 
 def _run_monitor(
@@ -63,7 +64,7 @@ def _run_monitor(
     """
     stopped = False
     for step in range(1, n_steps + 1):
-        monitor._dyn._temp = temp_fn(step)
+        monitor._atoms._temp = temp_fn(step)
         monitor._atoms._positions = pos_fn(step)
         try:
             monitor()
@@ -85,6 +86,7 @@ def _fast_cfg(**overrides) -> RampConfig:
         pos_convergence_window_mult=2,
         pos_convergence_min_window=3,
         pos_convergence_threshold=0.01,
+        pos_convergence_persistence=3,
     )
     defaults.update(overrides)
     return RampConfig(**defaults)
@@ -300,7 +302,7 @@ def test_reset_clears_state():
 
     # Ein paar Schritte laufen (kann vorzeitig stoppen)
     for step in range(1, 20):
-        monitor._dyn._temp = 300.0
+        monitor._atoms._temp = 300.0
         monitor._atoms._positions = np.zeros((4, 3))
         try:
             monitor()
@@ -353,7 +355,7 @@ def test_samples_property_returns_all():
     monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
 
     for step in range(1, 30):
-        monitor._dyn._temp = 300.0
+        monitor._atoms._temp = 300.0
         # Driftende Positionen → keine Konvergenz → kein Stop
         p = np.zeros((4, 3))
         p[:, 0] = step * 0.1
@@ -369,3 +371,66 @@ def test_samples_property_returns_all():
     assert all_samples.shape[0] == 14
     assert all_samples.shape[1] == 4
     assert all_samples.shape[2] == 3
+
+
+# ── 11. Persistenz: transienter RMS-Dip triggert keinen Stop ──────────────
+def test_persistence_prevents_transient_stop():
+    """Ein einzelner RMS-Wert unter Schwelle reicht nicht zum Stop.
+
+    Szenario: Positionen driften konstant (RMS hoch), aber für 2 Schritte
+    springt RMS kurz unter die Schwelle, dann wieder hoch.  Mit
+    persistence=3 sollte das NICHT als konvergiert gelten.
+    """
+    cfg = _fast_cfg(pos_convergence_persistence=3)
+    dyn = _FakeDyn()
+    atoms = _FakeAtoms(n_atoms=4)
+    monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
+
+    def temp_fn(step):
+        return 300.0
+
+    def pos_fn(step):
+        p = np.zeros((4, 3))
+        # Konstanter Drift, außer Schritt 8-9: kurz eingefroren
+        if step in (8, 9):
+            p[:, 0] = 0.7  # gleiche Position wie Schritt 7 → RMS ≈ 0
+        else:
+            p[:, 0] = 0.1 * step  # linearer Drift
+        return p
+
+    stopped, _ = _run_monitor(monitor, 50, temp_fn, pos_fn)
+    assert not stopped, "Transienter Dip darf nicht als Konvergenz zählen"
+
+
+# ── 12. Persistenz: dauerhaft unter Schwelle → Stop ───────────────────────
+def test_persistence_sustained_convergence_stops():
+    """N aufeinanderfolgende Schritte unter Schwelle → Stop.
+
+    Szenario: Positionen pendeln sich nach Schritt 8 ein.  Mit
+    persistence=3 sollte der Stop bei Schritt 8+3=11 passieren.
+    """
+    cfg = _fast_cfg(
+        pos_convergence_persistence=3,
+        pos_convergence_min_samples=5,
+        pos_convergence_min_window=3,
+    )
+    dyn = _FakeDyn()
+    atoms = _FakeAtoms(n_atoms=4)
+    monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
+
+    def temp_fn(step):
+        return 300.0
+
+    def pos_fn(step):
+        p = np.zeros((4, 3))
+        if step <= 7:
+            p[:, 0] = 0.1 * step  # Drift
+        else:
+            p[:, 0] = 1.0 + 0.0005 * np.sin(step)  # stabil
+        return p
+
+    stopped, stopped_at = _run_monitor(monitor, 100, temp_fn, pos_fn)
+    assert stopped, "Sollte stoppen nach sustained convergence"
+    assert stopped_at is not None
+    # Stop erst nach persistence Schritten unter Schwelle
+    assert stopped_at >= 10, f"Stop zu früh (stopped_at={stopped_at})"

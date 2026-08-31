@@ -85,6 +85,7 @@ class _CombinedEquilibriumMonitor:
         self._pos_window_mult = cfg.pos_convergence_window_mult
         self._pos_min_window = cfg.pos_convergence_min_window
         self._pos_threshold = cfg.pos_convergence_threshold
+        self._pos_persistence = max(cfg.pos_convergence_persistence, 1)
 
         # Zustand
         self._step_count = 0
@@ -92,6 +93,7 @@ class _CombinedEquilibriumMonitor:
         self._position_samples: list[np.ndarray] = []
         self._temp_converged = False
         self._pos_converged = False
+        self._pos_converged_count = 0   # aufeinanderfolgende Schritte unter Schwelle
         self._stopped_at: int | None = None
         self._converged_window_size: int | None = None
         self._period_samples: int | None = None
@@ -111,6 +113,7 @@ class _CombinedEquilibriumMonitor:
         self._position_samples.clear()
         self._temp_converged = False
         self._pos_converged = False
+        self._pos_converged_count = 0
         self._stopped_at = None
         self._converged_window_size = None
         self._period_samples = None
@@ -168,9 +171,9 @@ class _CombinedEquilibriumMonitor:
     def __call__(self) -> None:
         self._step_count += 1
 
-        # Temperatur sammeln
+        # Temperatur sammeln (aus Kinetic-Energie der Atome, nicht dyn)
         try:
-            temp = self._dyn.get_temperature()
+            temp = self._atoms.get_temperature()
             self._temperatures.append(float(temp))
             if len(self._temperatures) > self._temp_window:
                 self._temperatures = self._temperatures[-self._temp_window:]
@@ -199,12 +202,27 @@ class _CombinedEquilibriumMonitor:
                 if temp_rel_std_val < self._temp_rel_std:
                     self._temp_converged = True
 
-        # ── 2. Positions-Konvergenz ──
+        # ── 2. Positions-Konvergenz (mit Persistenz) ──
         pos_rms_val = float("nan")
         if len(self._position_samples) >= self._pos_min_samples:
             pos_rms_val = self._compute_pos_rms()
             if not self._pos_converged:
-                self._pos_converged = self._check_position_convergence()
+                if np.isnan(pos_rms_val):
+                    self._pos_converged_count = 0
+                elif pos_rms_val < self._pos_threshold:
+                    self._pos_converged_count += 1
+                    if self._pos_converged_count >= self._pos_persistence:
+                        self._pos_converged = True
+                        # Fenstergröße für konvergierte Samples speichern
+                        n = len(self._position_samples)
+                        window = max(
+                            self._pos_window_mult * (self._period_samples or 5),
+                            self._pos_min_window,
+                        )
+                        window = min(window, n // 2)
+                        self._converged_window_size = window
+                else:
+                    self._pos_converged_count = 0
 
         # ── Debug-Historie aufzeichnen ──
         self._history_steps.append(self._step_count)
@@ -245,31 +263,6 @@ class _CombinedEquilibriumMonitor:
         mean_prev = np.mean(samples[-2 * window:-window], axis=0)
         disp = mean_recent - mean_prev
         return float(np.sqrt(np.mean(np.sum(disp**2, axis=1))))
-
-    def _check_position_convergence(self) -> bool:
-        """Rolling-Mean-Konvergenz der Positionen prüfen.
-
-        Vergleicht zwei aufeinanderfolgende Rolling-Means.  Wenn deren
-        RMS-Verschiebung unter dem Schwellwert liegt, ist das strukturelle
-        Gleichgewicht erreicht.
-        """
-        rms_displacement = self._compute_pos_rms()
-        if np.isnan(rms_displacement):
-            return False
-
-        if rms_displacement < self._pos_threshold:
-            # Fenstergröße für konvergierte Samples speichern
-            samples = np.array(self._position_samples)
-            n = len(samples)
-            window = max(
-                self._pos_window_mult * self._period_samples,
-                self._pos_min_window,
-            )
-            window = min(window, n // 2)
-            self._converged_window_size = window
-            return True
-
-        return False
 
     @staticmethod
     def _estimate_oscillation_period(samples: np.ndarray) -> int:
@@ -338,6 +331,7 @@ class RampConfig:
     pos_convergence_window_mult: int = 3    # Fenster = mult × Schwingungsperiode
     pos_convergence_min_window: int = 5     # Mindestfenstergröße
     pos_convergence_threshold: float = 0.01 # RMS-Verschiebung < threshold → konvergiert (Å)
+    pos_convergence_persistence: int = 5    # N aufeinanderfolgende Schritte unter Schwelle nötig
     # Persistenz für Zerfalls-Erkennung (Lindemann): MSD muss für N
     # aufeinanderfolgende Schritte über dem Schwellwert bleiben, bevor
     # abgebrochen wird.  Filtert transiente Spikes.

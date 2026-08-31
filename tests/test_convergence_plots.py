@@ -20,16 +20,17 @@ class _FakeDyn:
     def __init__(self) -> None:
         self._temp = 300.0
 
-    def get_temperature(self) -> float:
-        return self._temp
-
 
 class _FakeAtoms:
     def __init__(self, n_atoms: int = 4) -> None:
         self._positions = np.zeros((n_atoms, 3))
+        self._temp = 300.0
 
     def get_positions(self) -> np.ndarray:
         return self._positions.copy()
+
+    def get_temperature(self) -> float:
+        return self._temp
 
 
 def _fast_cfg(**overrides) -> RampConfig:
@@ -42,6 +43,7 @@ def _fast_cfg(**overrides) -> RampConfig:
         pos_convergence_window_mult=2,
         pos_convergence_min_window=3,
         pos_convergence_threshold=0.01,
+        pos_convergence_persistence=3,
     )
     defaults.update(overrides)
     return RampConfig(**defaults)
@@ -57,7 +59,7 @@ def test_history_recorded():
 
     # 10 Schritte mit stabilen Positionen → sollte konvergieren und stoppen
     for step in range(1, 30):
-        monitor._dyn._temp = 300.0
+        monitor._atoms._temp = 300.0
         p = np.zeros((4, 3))
         p[:, 0] = 1.0 + 0.001 * np.sin(step)
         monitor._atoms._positions = p
@@ -87,7 +89,7 @@ def test_history_cleared_on_reset():
     monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
 
     for step in range(1, 15):
-        monitor._dyn._temp = 300.0
+        monitor._atoms._temp = 300.0
         monitor._atoms._positions = np.zeros((4, 3))
         try:
             monitor()
