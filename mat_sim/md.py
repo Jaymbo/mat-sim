@@ -359,7 +359,7 @@ class RampConfig:
     thermalization_steps: int = 1000    # Zeitschritte pro T-Stufe (1 ps bei 1 fs/Step)
     time_step: float = 1.0          # fs  (Standard für Oxid-MD)
     pressure: float = 1.0e-4        # GPa (≈ 1 atm)
-    temperature_time_constant: float = 200.0 * fs   # τ_T (träge → stabil)
+    temperature_time_constant: float = 50.0 * fs    # τ_T (kürzer → weniger Oszillation)
     pressure_time_constant: float = 2000.0 * fs     # τ_P (sehr träge)
     bulk_modulus: float = 100.0     # GPa (typisch für Übergangsmetall-Oxide)
     lindemann_fraction: float = 0.12
@@ -725,22 +725,13 @@ class ThermalRamp:
             self.atoms.get_volume(),
         )
 
-        # --- Schritt 2: NPT-MD initialisieren ----------------------------
-        start_temp = max(cfg.t_start, 1e-3)
-        dyn = NPT(
-            self.atoms,
-            timestep=cfg.time_step * fs,
-            temperature_K=start_temp,
-            externalstress=cfg.pressure * GPa,
-            ttime=cfg.temperature_time_constant,
-            # pfactor = τ_P² × B  (B = Bulk-Modulus in ASE-Einheiten)
-            pfactor=(cfg.pressure_time_constant**2) * (cfg.bulk_modulus * GPa),
-            loginterval=cfg.log_interval,
-        )
+        # --- Schritt 2: NPT-MD Objekt vorbereiten ------------------------
+        # Das NPT-Objekt wird pro Temperaturstufe NEU erstellt, damit der
+        # Nosé-Hoover-Thermostat-Zustand (zeta) nicht zwischen Stufen
+        # überlebt und Oszillationen verursacht.
 
-        # Kombinierter Gleichgewichts-Monitor (Temperatur + Positionen)
-        monitor = _CombinedEquilibriumMonitor(dyn, self.atoms, cfg)
-        dyn.attach(monitor, interval=1)
+        # Kombinierter Gleichgewichts-Monitor (wird pro T-Stufe neu ans dyn gehängt)
+        monitor = _CombinedEquilibriumMonitor(None, self.atoms, cfg)
 
         temperatures = np.arange(
             cfg.t_start, cfg.t_max + cfg.delta_t, cfg.delta_t
@@ -759,7 +750,6 @@ class ThermalRamp:
         for i, T in enumerate(temperatures):
             global_step = resume_step + 1 + i
             T_sim = max(T, 1e-3)  # 0 K vermeiden
-            dyn.set_temperature(temperature_K=T_sim)
 
             # Divergenz-Check VOR dem MD-Schritt
             if self._check_divergence():
@@ -770,15 +760,28 @@ class ThermalRamp:
             print(f"-> Starte MD-Simulation für T = {T:.1f} K ... "
                   f"(Schritt {global_step}/{resume_step + n_steps_total})", flush=True)
 
+            # ── Neues NPT-Objekt pro T-Stufe ──
+            # Verhindert, dass der Nosé-Hoover-Thermostat-Zustand (zeta)
+            # zwischen Stufen überlebt und Oszillationen verursacht.
+            dyn = NPT(
+                self.atoms,
+                timestep=cfg.time_step * fs,
+                temperature_K=T_sim,
+                externalstress=cfg.pressure * GPa,
+                ttime=cfg.temperature_time_constant,
+                pfactor=(cfg.pressure_time_constant**2) * (cfg.bulk_modulus * GPa),
+                loginterval=cfg.log_interval,
+            )
+
             # Geschwindigkeiten bei Zieltemperatur initialisieren
             # (Maxwell-Boltzmann + Schwerpunktsbewegung entfernen).
-            # Ohne dies startet die MD bei T≈0 K und der Thermostat
-            # heizt nur extrem langsam auf (τ_T = 200 fs).
             MaxwellBoltzmannDistribution(self.atoms, temperature_K=T_sim)
             Stationary(self.atoms)  # COM-Bewegung nullen
 
-            # Thermalisieren (mit Profiling + Early Stopping)
+            # Monitor an neues dyn anhängen und zurücksetzen
+            monitor._dyn = dyn
             monitor.reset()
+            dyn.attach(monitor, interval=1)
             t0 = time.perf_counter()
             early_stopped = False
             try:
