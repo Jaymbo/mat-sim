@@ -27,3 +27,4 @@ logs/
 *.swo
 *~
 .DS_Store
+debug_convergence/*

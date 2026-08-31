@@ -11,7 +11,9 @@ Klasse ``ThermalRamp`` kapselt die komplette Schleife:
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 
@@ -110,6 +112,11 @@ class _CombinedEquilibriumMonitor:
         self._history_temp_converged: list[bool] = []
         self._history_pos_converged: list[bool] = []
 
+        # Rohdaten (jeder Schritt, für interaktive Plots / Frequenzanalyse)
+        self._raw_steps: list[int] = []
+        self._raw_temperatures: list[float] = []
+        self._raw_mean_pos: list[list[float]] = []  # [x, y, z] mittlere Position aller Atome
+
     # ── API ────────────────────────────────────────────────────────────
     def reset(self) -> None:
         """Zustand für eine neue Temperaturstufe zurücksetzen."""
@@ -127,6 +134,9 @@ class _CombinedEquilibriumMonitor:
         self._history_pos_rms.clear()
         self._history_temp_converged.clear()
         self._history_pos_converged.clear()
+        self._raw_steps.clear()
+        self._raw_temperatures.clear()
+        self._raw_mean_pos.clear()
 
     @property
     def stopped_at(self) -> int | None:
@@ -172,11 +182,30 @@ class _CombinedEquilibriumMonitor:
             "pos_converged": list(self._history_pos_converged),
         }
 
+    @property
+    def raw_data(self) -> dict[str, list]:
+        """Rohdaten der aktuellen T-Stufe (jeder MD-Schritt).
+
+        Enthält die ungefilterten Temperatur- und Positionswerte für
+        interaktive Plots und Frequenzanalyse.
+
+        Returns
+        -------
+        dict
+            Schlüssel: ``steps``, ``temperatures``, ``mean_pos`` (x/y/z).
+        """
+        return {
+            "steps": list(self._raw_steps),
+            "temperatures": list(self._raw_temperatures),
+            "mean_pos": list(self._raw_mean_pos),
+        }
+
     # ── ASE-Callback-Signatur ───────────────────────────────────────────
     def __call__(self) -> None:
         self._step_count += 1
 
         # Temperatur sammeln (aus Kinetic-Energie der Atome, nicht dyn)
+        temp: float | None = None
         try:
             temp = self._atoms.get_temperature()
             self._temperatures.append(float(temp))
@@ -188,6 +217,17 @@ class _CombinedEquilibriumMonitor:
         # Positionen sammeln (alle pos_sample_interval Schritte)
         if self._step_count % self._pos_sample_interval == 0:
             self._position_samples.append(self._atoms.get_positions().copy())
+
+        # ── Rohdaten aufzeichnen (jeder Schritt, für interaktive Plots) ──
+        self._raw_steps.append(self._step_count)
+        self._raw_temperatures.append(float(temp) if temp is not None else float("nan"))
+        try:
+            mean_pos = np.mean(self._atoms.get_positions(), axis=0)
+            self._raw_mean_pos.append(
+                [float(mean_pos[0]), float(mean_pos[1]), float(mean_pos[2])]
+            )
+        except Exception:
+            self._raw_mean_pos.append([float("nan"), float("nan"), float("nan")])
 
         # ── Konvergenz-Prüfung (erst nach Mindestschritten) ──
         past_min_steps = self._step_count >= self._temp_min_steps
@@ -352,9 +392,97 @@ class RampConfig:
     debug_plot_dir: str = "debug_convergence"
 
 
+# ── Debug: Rohdaten als JSON speichern ──────────────────────────────────────
+def save_raw_data_json(
+    raw_data: dict[str, list],
+    history: dict[str, list],
+    temperature: float,
+    formula: str,
+    material_id: str,
+    output_dir: str,
+    stopped_at: int | None,
+) -> str:
+    """Rohdaten einer T-Stufe als JSON speichern (für interaktive Plots).
+
+    Enthält die ungefilterten Temperatur- und Positionswerte jedes
+    MD-Schritts sowie die Konvergenz-Historie.  Ermöglicht Zoom,
+    Frequenzanalyse und Diagnose in externen Tools (z. B. Plotly, Jupyter).
+
+    Die Datei wird im selben Ordner wie die Konvergenz-PNG abgelegt,
+    nur mit ``.json``-Endung.
+
+    Parameters
+    ----------
+    raw_data
+        Rohdaten aus ``monitor.raw_data`` (``steps``, ``temperatures``,
+        ``mean_pos``).
+    history
+        Konvergenz-Historie aus ``monitor.history``.
+    temperature
+        Temperatur der aktuellen Stufe (K) — für Dateinamen.
+    formula
+        Chemische Formel — für Ordnername.
+    material_id
+        MP-ID — für Ordnername.
+    output_dir
+        Basis-Verzeichnis für Debug-Dateien.
+    stopped_at
+        MD-Schritt, bei dem gestoppt wurde, oder *None*.
+
+    Returns
+    -------
+    str
+        Pfad zur gespeicherten JSON-Datei.
+    """
+    from pathlib import Path
+
+    safe_formula = formula.replace(" ", "_")
+    subdir = Path(output_dir) / f"{material_id}_{safe_formula}"
+    subdir.mkdir(parents=True, exist_ok=True)
+
+    filename = subdir / f"convergence_T{temperature:.0f}K.json"
+    filepath = str(filename)
+
+    # NaN-Werte zu None konvertieren (JSON-kompatibel)
+    def _clean(val):
+        if val is None:
+            return None
+        if isinstance(val, float) and math.isnan(val):
+            return None
+        return val
+
+    payload = {
+        "material_id": material_id,
+        "formula": formula,
+        "temperature_K": temperature,
+        "stopped_at": stopped_at,
+        "raw": {
+            "steps": raw_data["steps"],
+            "temperatures": [_clean(t) for t in raw_data["temperatures"]],
+            "mean_pos": [
+                [_clean(c) for c in pos]
+                for pos in raw_data["mean_pos"]
+            ],
+        },
+        "history": {
+            "steps": history["steps"],
+            "temp_rel_std": [_clean(v) for v in history["temp_rel_std"]],
+            "pos_rms": [_clean(v) for v in history["pos_rms"]],
+            "temp_converged": history["temp_converged"],
+            "pos_converged": history["pos_converged"],
+        },
+    }
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    return filepath
+
+
 # ── Debug: Konvergenz-Plot speichern ────────────────────────────────────────
 def save_convergence_plot(
     history: dict[str, list],
+    raw_data: dict[str, list],
     temperature: float,
     formula: str,
     material_id: str,
@@ -365,17 +493,23 @@ def save_convergence_plot(
 ) -> str:
     """Konvergenz-Verlauf als PNG speichern (headless, matplotlib Agg-Backend).
 
-    Erzeugt zwei Subplots:
+    Erzeugt **vier** Subplots:
       1. Temperatur rel. Std-Abw. über MD-Schritten mit Schwellwert-Linie
       2. Positions-RMS-Verschiebung über MD-Schritten mit Schwellwert-Linie
+      3. Roh-Temperatur über MD-Schritten (jeder Schritt)
+      4. Roh mittlere Position (x/y/z) über MD-Schritten
 
-    Beide zeigen grüne Markierung wenn konvergiert, rote Linie für
-    Early-Stop-Punkt.
+    Die oberen beiden Subplots zeigen die Konvergenz-Metriken (log-Skala),
+    die unteren beiden die ungefilterten Rohdaten (lineare Skala) zum
+    Erkennen von Drift, Oszillationen oder anomalem Verhalten.
 
     Parameters
     ----------
     history
         Konvergenz-Historie aus ``monitor.history``.
+    raw_data
+        Rohdaten aus ``monitor.raw_data`` (``steps``, ``temperatures``,
+        ``mean_pos``).
     temperature
         Temperatur der aktuellen Stufe (K) — für Dateinamen und Titel.
     formula
@@ -420,7 +554,13 @@ def save_convergence_plot(
     temp_rel_std = np.where(temp_rel_std == 0, _EPS, temp_rel_std)
     pos_rms = np.where(pos_rms == 0, _EPS, pos_rms)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    # Rohdaten extrahieren
+    raw_steps = np.array(raw_data["steps"], dtype=float)
+    raw_temps = np.array(raw_data["temperatures"], dtype=float)
+    raw_mean_pos = np.array(raw_data["mean_pos"], dtype=float)  # (n_steps, 3)
+
+    fig, axes = plt.subplots(4, 1, figsize=(10, 14), sharex=True)
+    ax1, ax2, ax3, ax4 = axes
 
     # ── Subplot 1: Temperatur rel. Std ──
     valid_temp = ~np.isnan(temp_rel_std)
@@ -435,7 +575,7 @@ def save_convergence_plot(
         first_conv = temp_conv_idx[0]
         ax1.axvline(x=steps[first_conv], color="g", linestyle=":",
                     linewidth=1.0, label=f"konvergiert (Schritt {int(steps[first_conv])})")
-    ax1.set_ylabel("rel. Std-Abw. (Temperatur)")
+    ax1.set_ylabel("rel. Std-Abw.\n(Temperatur)")
     ax1.set_title(f"{formula} ({material_id}) — T = {temperature:.1f} K")
     ax1.legend(loc="upper right", fontsize=8)
     ax1.set_yscale("log")
@@ -457,11 +597,42 @@ def save_convergence_plot(
     if stopped_at is not None:
         ax2.axvline(x=stopped_at, color="orange", linestyle="-",
                     linewidth=1.5, label=f"Stop (Schritt {stopped_at})")
-    ax2.set_xlabel("MD-Schritt")
-    ax2.set_ylabel("RMS-Verschiebung (Å)")
+    ax2.set_ylabel("RMS-Verschiebung\n(Å)")
     ax2.legend(loc="upper right", fontsize=8)
     ax2.set_yscale("log")
     ax2.grid(True, alpha=0.3)
+
+    # ── Subplot 3: Roh-Temperatur über Schritten ──
+    if len(raw_steps) > 0:
+        valid_raw_t = ~np.isnan(raw_temps)
+        if np.any(valid_raw_t):
+            ax3.plot(raw_steps[valid_raw_t], raw_temps[valid_raw_t],
+                     "b-", linewidth=0.6, label="T (roh)")
+    if stopped_at is not None:
+        ax3.axvline(x=stopped_at, color="orange", linestyle="-",
+                    linewidth=1.5, label=f"Stop ({stopped_at})")
+    ax3.set_ylabel("Temperatur (K)")
+    ax3.legend(loc="upper right", fontsize=8)
+    ax3.grid(True, alpha=0.3)
+
+    # ── Subplot 4: Roh mittlere Position (x/y/z) über Schritten ──
+    if len(raw_steps) > 0 and raw_mean_pos.shape[0] > 0:
+        labels = ["x", "y", "z"]
+        colors = ["r", "g", "b"]
+        for dim in range(3):
+            vals = raw_mean_pos[:, dim]
+            valid = ~np.isnan(vals)
+            if np.any(valid):
+                ax4.plot(raw_steps[valid], vals[valid],
+                         color=colors[dim], linewidth=0.6,
+                         label=f"mean {labels[dim]}")
+    if stopped_at is not None:
+        ax4.axvline(x=stopped_at, color="orange", linestyle="-",
+                    linewidth=1.5, label=f"Stop ({stopped_at})")
+    ax4.set_xlabel("MD-Schritt")
+    ax4.set_ylabel("mittlere Position (Å)")
+    ax4.legend(loc="upper right", fontsize=8)
+    ax4.grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(filepath, dpi=150)
@@ -631,12 +802,13 @@ class ThermalRamp:
             print(f"   [ERFOLG] T = {T:.1f} K nach {elapsed:.2f} Sekunden beendet. "
                   f"(MSD: {metrics.msd:.4f})", flush=True)
 
-            # ── Debug: Konvergenz-Plot speichern ──
+            # ── Debug: Konvergenz-Plot + Rohdaten-JSON speichern ──
             if cfg.debug_convergence_plots:
                 try:
                     formula = self.atoms.get_chemical_formula()
                     plot_path = save_convergence_plot(
                         history=monitor.history,
+                        raw_data=monitor.raw_data,
                         temperature=T,
                         formula=formula,
                         material_id=material_id,
@@ -646,8 +818,18 @@ class ThermalRamp:
                         stopped_at=monitor.stopped_at,
                     )
                     logger.info("Debug-Plot gespeichert: %s", plot_path)
+                    json_path = save_raw_data_json(
+                        raw_data=monitor.raw_data,
+                        history=monitor.history,
+                        temperature=T,
+                        formula=formula,
+                        material_id=material_id,
+                        output_dir=cfg.debug_plot_dir,
+                        stopped_at=monitor.stopped_at,
+                    )
+                    logger.info("Debug-JSON gespeichert: %s", json_path)
                 except Exception as exc:
-                    logger.warning("Debug-Plot fehlgeschlagen: %s", exc)
+                    logger.warning("Debug-Plot/JSON fehlgeschlagen: %s", exc)
 
             # ── Checkpoint nur alle N Schritte (und immer vor Abbruch) ───
             is_interval_step = global_step % cfg.checkpoint_interval == 0
