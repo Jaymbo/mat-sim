@@ -44,7 +44,9 @@ def _fast_cfg(**overrides) -> RampConfig:
         pos_convergence_min_samples=6,
         pos_convergence_window_mult=2,
         pos_convergence_min_window=3,
-        pos_convergence_threshold=0.01,
+        pos_convergence_threshold=0.5,
+        pos_convergence_rel_std=0.10,
+        pos_convergence_eval_window=10,
         pos_convergence_persistence=3,
     )
     defaults.update(overrides)
@@ -74,6 +76,7 @@ def test_history_recorded():
     assert len(hist["steps"]) > 0
     assert len(hist["temp_rel_std"]) == len(hist["steps"])
     assert len(hist["pos_rms"]) == len(hist["steps"])
+    assert len(hist["pos_rel_std"]) == len(hist["steps"])
     assert len(hist["temp_converged"]) == len(hist["steps"])
     assert len(hist["pos_converged"]) == len(hist["steps"])
 
@@ -122,6 +125,12 @@ def test_save_convergence_plot_creates_png(tmp_path):
                     0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005,
                     0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005,
                     0.005, 0.005, 0.005, 0.005, 0.005],
+        "pos_rel_std": [float("nan")] * 2 + [0.2, 0.15, 0.1, 0.08, 0.06,
+                    0.05, 0.04, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03,
+                    0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03,
+                    0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03,
+                    0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03,
+                    0.03, 0.03, 0.03, 0.03, 0.03, 0.03],
         "temp_converged": [False] * 4 + [True] * 41,
         "pos_converged": [False] * 6 + [True] * 39,
     }
@@ -139,7 +148,7 @@ def test_save_convergence_plot_creates_png(tmp_path):
         material_id="mp-18248",
         output_dir=str(tmp_path),
         early_stop_rel_std=0.02,
-        pos_convergence_threshold=0.01,
+        pos_convergence_rel_std=0.01,
         stopped_at=45,
     )
 
@@ -156,6 +165,7 @@ def test_save_convergence_plot_nan_heavy(tmp_path):
         "steps": [1, 2, 3, 4, 5],
         "temp_rel_std": [float("nan"), float("nan"), 0.1, 0.05, 0.02],
         "pos_rms": [float("nan")] * 5,
+        "pos_rel_std": [float("nan")] * 5,
         "temp_converged": [False, False, False, False, True],
         "pos_converged": [False] * 5,
     }
@@ -174,7 +184,7 @@ def test_save_convergence_plot_nan_heavy(tmp_path):
         material_id="mp-390",
         output_dir=str(tmp_path),
         early_stop_rel_std=0.02,
-        pos_convergence_threshold=0.01,
+        pos_convergence_rel_std=0.01,
         stopped_at=None,
     )
 
@@ -188,6 +198,7 @@ def test_save_convergence_plot_creates_subdirectory(tmp_path):
         "steps": [1, 2],
         "temp_rel_std": [0.1, 0.02],
         "pos_rms": [0.1, 0.005],
+        "pos_rel_std": [float("nan"), 0.05],
         "temp_converged": [False, True],
         "pos_converged": [False, True],
     }
@@ -205,7 +216,7 @@ def test_save_convergence_plot_creates_subdirectory(tmp_path):
         material_id="mp-510",
         output_dir=str(tmp_path),
         early_stop_rel_std=0.02,
-        pos_convergence_threshold=0.01,
+        pos_convergence_rel_std=0.01,
         stopped_at=2,
     )
 
@@ -273,6 +284,7 @@ def test_save_raw_data_json_creates_file(tmp_path):
         "steps": [1, 2, 3],
         "temp_rel_std": [float("nan"), 0.1, 0.02],
         "pos_rms": [float("nan"), 0.05, 0.005],
+        "pos_rel_std": [float("nan"), 0.15, 0.03],
         "temp_converged": [False, False, True],
         "pos_converged": [False, False, True],
     }
@@ -325,6 +337,7 @@ def test_save_raw_data_json_stopped_at_none(tmp_path):
         "steps": [1],
         "temp_rel_std": [0.1],
         "pos_rms": [0.05],
+        "pos_rel_std": [float("nan")],
         "temp_converged": [False],
         "pos_converged": [False],
     }

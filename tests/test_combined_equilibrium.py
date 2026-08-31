@@ -84,7 +84,9 @@ def _fast_cfg(**overrides) -> RampConfig:
         pos_convergence_min_samples=6,
         pos_convergence_window_mult=2,
         pos_convergence_min_window=3,
-        pos_convergence_threshold=0.01,
+        pos_convergence_threshold=0.5,
+        pos_convergence_rel_std=0.10,
+        pos_convergence_eval_window=10,
         pos_convergence_persistence=3,
     )
     defaults.update(overrides)
@@ -518,7 +520,7 @@ def test_non_sticky_pos_falls_away_no_stop():
         if 8 <= step <= 20:
             p[:, 0] = 1.0 + 0.0005 * np.sin(step)
         elif step > 20:
-            p[:, 0] = 1.0 + 0.1 * (step - 20)  # Drift
+            p[:, 0] = 1.0 + 0.5 * (step - 20)  # Drift (schnell genug für pos_rms > ceiling)
         else:
             p[:, 0] = 0.1 * step
         return p

@@ -52,10 +52,13 @@ class _CombinedEquilibriumMonitor:
     Stoppt die MD nur, wenn **beide Bedingungen im selben Schritt** erfüllt sind:
 
     1. **Thermisches Gleichgewicht** – rel. Std-Abw. der Temperatur im
-       Rolling-Window < ``early_stop_rel_std``.
-    2. **Strukturelles Gleichgewicht** – Rolling-Mean der Positionen
-       konvergiert: aufeinanderfolgende Rolling-Means unterscheiden sich um
-       weniger als ``pos_convergence_threshold``.
+       Rolling-Window < ``early_stop_rel_std`` (10 %, über natürlicher
+       NVT-Fluktuation von 7.2 % für N=128).
+    2. **Strukturelles Gleichgewicht** – Plateau-Erkennung: die rel.
+       Std-Abw. von pos_rms (RMS-Verschiebung der Rolling-Mean-Positionen)
+       über einem Auswertefenster < ``pos_convergence_rel_std`` (10 %).
+       Ein absoluter Schwellwert funktioniert nicht, weil pos_rms mit T
+       skaliert (thermische Vibration ~ sqrt(T/N)).
 
     Beide Flags sind **nicht-sticky**: sie werden jeden Schritt neu
     ausgewertet.  Wenn eine Bedingung in einem Schritt nicht mehr erfüllt
@@ -93,6 +96,9 @@ class _CombinedEquilibriumMonitor:
         self._pos_window_mult = cfg.pos_convergence_window_mult
         self._pos_min_window = cfg.pos_convergence_min_window
         self._pos_threshold = cfg.pos_convergence_threshold
+        self._pos_floor = cfg.pos_convergence_floor
+        self._pos_rel_std = cfg.pos_convergence_rel_std
+        self._pos_eval_window = cfg.pos_convergence_eval_window
         self._pos_persistence = max(cfg.pos_convergence_persistence, 1)
 
         # Zustand
@@ -110,6 +116,7 @@ class _CombinedEquilibriumMonitor:
         self._history_steps: list[int] = []
         self._history_temp_rel_std: list[float] = []
         self._history_pos_rms: list[float] = []
+        self._history_pos_rel_std: list[float] = []
         self._history_temp_converged: list[bool] = []
         self._history_pos_converged: list[bool] = []
 
@@ -133,6 +140,7 @@ class _CombinedEquilibriumMonitor:
         self._history_steps.clear()
         self._history_temp_rel_std.clear()
         self._history_pos_rms.clear()
+        self._history_pos_rel_std.clear()
         self._history_temp_converged.clear()
         self._history_pos_converged.clear()
         self._raw_steps.clear()
@@ -173,12 +181,13 @@ class _CombinedEquilibriumMonitor:
         -------
         dict
             Schlüssel: ``steps``, ``temp_rel_std``, ``pos_rms``,
-            ``temp_converged``, ``pos_converged``.
+            ``pos_rel_std``, ``temp_converged``, ``pos_converged``.
         """
         return {
             "steps": list(self._history_steps),
             "temp_rel_std": list(self._history_temp_rel_std),
             "pos_rms": list(self._history_pos_rms),
+            "pos_rel_std": list(self._history_pos_rel_std),
             "temp_converged": list(self._history_temp_converged),
             "pos_converged": list(self._history_pos_converged),
         }
@@ -248,16 +257,44 @@ class _CombinedEquilibriumMonitor:
                 temp_rel_std_val = float(np.std(window) / mean_t)
                 self._temp_converged = temp_rel_std_val < self._temp_rel_std
 
-        # ── 2. Positions-Konvergenz (nicht-sticky, mit Persistenz) ──
-        #  Beide Flags werden jeden Schritt neu bewertet.  Ein Stop
-        #  erfolgt nur, wenn **beide im selben Schritt** True sind.
+        # ── 2. Positions-Konvergenz (Plateau-Erkennung) ──
+        #  pos_rms hat ein Plateau erreicht, wenn seine rel. Std-Abw.
+        #  über einem Auswertefenster klein genug ist.  Ein absoluter
+        #  Schwellwert funktioniert nicht, weil pos_rms mit T skaliert
+        #  (thermische Vibration der mittleren Position ~ sqrt(T/N)).
+        #  Beide Flags werden jeden Schritt neu bewertet.
         pos_rms_val = float("nan")
+        pos_rel_std_val = float("nan")
         self._pos_converged = False
         if past_min_steps and len(self._position_samples) >= self._pos_min_samples:
             pos_rms_val = self._compute_pos_rms()
-            if np.isnan(pos_rms_val):
+            self._history_pos_rms.append(pos_rms_val)
+
+            # Plateau-Erkennung mit drei Stufen:
+            #   1. pos_rms < floor → direkt konvergiert (sehr kleine Verschiebung)
+            #   2. floor ≤ pos_rms < ceiling → rel-std über eval_window prüfen
+            #   3. pos_rms ≥ ceiling → nicht konvergiert (Drift)
+            pos_below_ceiling = (not np.isnan(pos_rms_val)) and (
+                pos_rms_val < self._pos_threshold
+            )
+            pos_below_floor = (not np.isnan(pos_rms_val)) and (
+                pos_rms_val < self._pos_floor
+            )
+
+            if pos_below_floor:
+                # Sehr kleine Verschiebung → direkt als konvergiert werten
+                pos_rel_std_val = 0.0
+            elif pos_below_ceiling and len(self._history_pos_rms) >= self._pos_eval_window:
+                eval_data = np.array(self._history_pos_rms[-self._pos_eval_window:])
+                mean_pr = np.mean(eval_data)
+                if mean_pr > 1e-12:
+                    pos_rel_std_val = float(np.std(eval_data) / mean_pr)
+                else:
+                    pos_rel_std_val = float("nan")
+
+            if np.isnan(pos_rel_std_val) or not pos_below_ceiling:
                 self._pos_converged_count = 0
-            elif pos_rms_val < self._pos_threshold:
+            elif pos_rel_std_val < self._pos_rel_std:
                 self._pos_converged_count += 1
             else:
                 self._pos_converged_count = 0
@@ -274,11 +311,14 @@ class _CombinedEquilibriumMonitor:
                 )
                 window = min(window, n // 2)
                 self._converged_window_size = window
+        else:
+            self._history_pos_rms.append(pos_rms_val)
 
         # ── Debug-Historie aufzeichnen (jeder Schritt, nicht erst ab min_steps) ──
+        # pos_rms wurde bereits im Konvergenz-Block an _history_pos_rms angefügt.
         self._history_steps.append(self._step_count)
         self._history_temp_rel_std.append(temp_rel_std_val)
-        self._history_pos_rms.append(pos_rms_val)
+        self._history_pos_rel_std.append(pos_rel_std_val)
         self._history_temp_converged.append(self._temp_converged)
         self._history_pos_converged.append(self._pos_converged)
 
@@ -375,14 +415,17 @@ class RampConfig:
     # Early Stopping (thermisches Gleichgewicht)
     early_stop_min_steps: int = 100     # Mindestschritte, bevor Abbruch geprüft wird
     early_stop_window: int = 100        # Grösse des rotierenden Fensters
-    early_stop_rel_std: float = 0.05    # rel. Std-Abw.-Schwelle (5 %, NPT-tauglich)
+    early_stop_rel_std: float = 0.10    # rel. Std-Abw.-Schwelle (10 %, über NVT-Fluktuation von 7.2 % für N=128)
     # MSD-Sampling (vibrational MSD um Gleichgewichtsposition, nicht 0 K)
     msd_sample_interval: int = 1        # jeder MD-Schritt Positionen sampeln (präzise Autokorrelation)
-    # Positions-Konvergenz (Rolling-Mean)
+    # Positions-Konvergenz (Rolling-Mean + Plateau-Erkennung)
     pos_convergence_min_samples: int = 100  # Mindestsamples vor Prüfung (= 100 MD-Schritte)
     pos_convergence_window_mult: int = 3    # Fenster = mult × Schwingungsperiode
     pos_convergence_min_window: int = 100   # Mindestfenstergröße (100 Samples = 100 MD-Schritte = 100 fs)
-    pos_convergence_threshold: float = 0.01 # RMS-Verschiebung < threshold → konvergiert (Å)
+    pos_convergence_threshold: float = 0.5  # Absoluter Ceiling für pos_rms (verhindert Drift-Konvergenz)
+    pos_convergence_floor: float = 0.001   # Absoluter Floor: pos_rms < floor → konvergiert (skip rel-std)
+    pos_convergence_rel_std: float = 0.10   # Plateau-Erkennung: rel. Std von pos_rms über eval_window < 10 %
+    pos_convergence_eval_window: int = 500  # Fenster für Plateau-Erkennung (500 MD-Schritte)
     pos_convergence_persistence: int = 5    # N aufeinanderfolgende Schritte unter Schwelle nötig
     # Persistenz für Zerfalls-Erkennung (Lindemann): MSD muss für N
     # aufeinanderfolgende Schritte über dem Schwellwert bleiben, bevor
@@ -469,6 +512,7 @@ def save_raw_data_json(
             "steps": history["steps"],
             "temp_rel_std": [_clean(v) for v in history["temp_rel_std"]],
             "pos_rms": [_clean(v) for v in history["pos_rms"]],
+            "pos_rel_std": [_clean(v) for v in history["pos_rel_std"]],
             "temp_converged": history["temp_converged"],
             "pos_converged": history["pos_converged"],
         },
@@ -489,20 +533,17 @@ def save_convergence_plot(
     material_id: str,
     output_dir: str,
     early_stop_rel_std: float,
-    pos_convergence_threshold: float,
+    pos_convergence_rel_std: float,
     stopped_at: int | None,
 ) -> str:
     """Konvergenz-Verlauf als PNG speichern (headless, matplotlib Agg-Backend).
 
-    Erzeugt **vier** Subplots:
+    Erzeugt **fünf** Subplots:
       1. Temperatur rel. Std-Abw. über MD-Schritten mit Schwellwert-Linie
-      2. Positions-RMS-Verschiebung über MD-Schritten mit Schwellwert-Linie
-      3. Roh-Temperatur über MD-Schritten (jeder Schritt)
-      4. Roh mittlere Position (x/y/z) über MD-Schritten
-
-    Die oberen beiden Subplots zeigen die Konvergenz-Metriken (log-Skala),
-    die unteren beiden die ungefilterten Rohdaten (lineare Skala) zum
-    Erkennen von Drift, Oszillationen oder anomalem Verhalten.
+      2. Positions-RMS-Verschiebung über MD-Schritten
+      3. Positions-Plateau: rel. Std von pos_rms mit Schwellwert-Linie
+      4. Roh-Temperatur über MD-Schritten (jeder Schritt)
+      5. Roh mittlere Position (x/y/z) über MD-Schritten
 
     Parameters
     ----------
@@ -521,8 +562,8 @@ def save_convergence_plot(
         Basis-Verzeichnis für Debug-Plots.
     early_stop_rel_std
         Schwellwert für Temperatur-Konvergenz (für horizontale Linie).
-    pos_convergence_threshold
-        Schwellwert für Positions-Konvergenz (für horizontale Linie).
+    pos_convergence_rel_std
+        Schwellwert für Positions-Plateau (für horizontale Linie).
     stopped_at
         MD-Schritt, bei dem gestoppt wurde, oder *None*.
 
@@ -547,6 +588,7 @@ def save_convergence_plot(
     steps = np.array(history["steps"], dtype=float)
     temp_rel_std = np.array(history["temp_rel_std"], dtype=float)
     pos_rms = np.array(history["pos_rms"], dtype=float)
+    pos_rel_std = np.array(history.get("pos_rel_std", []), dtype=float)
     temp_conv = np.array(history["temp_converged"], dtype=bool)
     pos_conv = np.array(history["pos_converged"], dtype=bool)
 
@@ -554,14 +596,15 @@ def save_convergence_plot(
     _EPS = 1e-12
     temp_rel_std = np.where(temp_rel_std == 0, _EPS, temp_rel_std)
     pos_rms = np.where(pos_rms == 0, _EPS, pos_rms)
+    pos_rel_std = np.where(pos_rel_std == 0, _EPS, pos_rel_std)
 
     # Rohdaten extrahieren
     raw_steps = np.array(raw_data["steps"], dtype=float)
     raw_temps = np.array(raw_data["temperatures"], dtype=float)
     raw_mean_pos = np.array(raw_data["mean_pos"], dtype=float)  # (n_steps, 3)
 
-    fig, axes = plt.subplots(4, 1, figsize=(10, 14), sharex=True)
-    ax1, ax2, ax3, ax4 = axes
+    fig, axes = plt.subplots(5, 1, figsize=(10, 17), sharex=True)
+    ax1, ax2, ax3, ax4, ax5 = axes
 
     # ── Subplot 1: Temperatur rel. Std ──
     valid_temp = ~np.isnan(temp_rel_std)
@@ -582,13 +625,11 @@ def save_convergence_plot(
     ax1.set_yscale("log")
     ax1.grid(True, alpha=0.3)
 
-    # ── Subplot 2: Positions-RMS ──
+    # ── Subplot 2: Positions-RMS (raw) ──
     valid_pos = ~np.isnan(pos_rms)
     if np.any(valid_pos):
         ax2.plot(steps[valid_pos], pos_rms[valid_pos],
                  "b-", linewidth=0.8, label="RMS (Rolling-Mean Positionen)")
-    ax2.axhline(y=pos_convergence_threshold, color="r", linestyle="--",
-                linewidth=0.8, label=f"Schwelle ({pos_convergence_threshold:.3f} Å)")
     pos_conv_idx = np.where(pos_conv)[0]
     if len(pos_conv_idx) > 0:
         first_conv = pos_conv_idx[0]
@@ -603,20 +644,40 @@ def save_convergence_plot(
     ax2.set_yscale("log")
     ax2.grid(True, alpha=0.3)
 
-    # ── Subplot 3: Roh-Temperatur über Schritten ──
+    # ── Subplot 3: Positions-Plateau (rel. Std von pos_rms) ──
+    if len(pos_rel_std) == len(steps):
+        valid_prs = ~np.isnan(pos_rel_std)
+        if np.any(valid_prs):
+            ax3.plot(steps[valid_prs], pos_rel_std[valid_prs],
+                     "b-", linewidth=0.8, label="rel. Std (pos_rms)")
+    ax3.axhline(y=pos_convergence_rel_std, color="r", linestyle="--",
+                linewidth=0.8, label=f"Schwelle ({pos_convergence_rel_std:.2f})")
+    if len(pos_conv_idx) > 0:
+        first_conv = pos_conv_idx[0]
+        ax3.axvline(x=steps[first_conv], color="g", linestyle=":",
+                    linewidth=1.0, label=f"konvergiert (Schritt {int(steps[first_conv])})")
+    if stopped_at is not None:
+        ax3.axvline(x=stopped_at, color="orange", linestyle="-",
+                    linewidth=1.5, label=f"Stop (Schritt {stopped_at})")
+    ax3.set_ylabel("rel. Std (pos_rms)")
+    ax3.legend(loc="upper right", fontsize=8)
+    ax3.set_yscale("log")
+    ax3.grid(True, alpha=0.3)
+
+    # ── Subplot 4: Roh-Temperatur über Schritten ──
     if len(raw_steps) > 0:
         valid_raw_t = ~np.isnan(raw_temps)
         if np.any(valid_raw_t):
-            ax3.plot(raw_steps[valid_raw_t], raw_temps[valid_raw_t],
+            ax4.plot(raw_steps[valid_raw_t], raw_temps[valid_raw_t],
                      "b-", linewidth=0.6, label="T (roh)")
     if stopped_at is not None:
-        ax3.axvline(x=stopped_at, color="orange", linestyle="-",
+        ax4.axvline(x=stopped_at, color="orange", linestyle="-",
                     linewidth=1.5, label=f"Stop ({stopped_at})")
-    ax3.set_ylabel("Temperatur (K)")
-    ax3.legend(loc="upper right", fontsize=8)
-    ax3.grid(True, alpha=0.3)
+    ax4.set_ylabel("Temperatur (K)")
+    ax4.legend(loc="upper right", fontsize=8)
+    ax4.grid(True, alpha=0.3)
 
-    # ── Subplot 4: Roh mittlere Position (x/y/z) über Schritten ──
+    # ── Subplot 5: Roh mittlere Position (x/y/z) über Schritten ──
     if len(raw_steps) > 0 and raw_mean_pos.shape[0] > 0:
         labels = ["x", "y", "z"]
         colors = ["r", "g", "b"]
@@ -624,16 +685,16 @@ def save_convergence_plot(
             vals = raw_mean_pos[:, dim]
             valid = ~np.isnan(vals)
             if np.any(valid):
-                ax4.plot(raw_steps[valid], vals[valid],
+                ax5.plot(raw_steps[valid], vals[valid],
                          color=colors[dim], linewidth=0.6,
                          label=f"mean {labels[dim]}")
     if stopped_at is not None:
-        ax4.axvline(x=stopped_at, color="orange", linestyle="-",
+        ax5.axvline(x=stopped_at, color="orange", linestyle="-",
                     linewidth=1.5, label=f"Stop ({stopped_at})")
-    ax4.set_xlabel("MD-Schritt")
-    ax4.set_ylabel("mittlere Position (Å)")
-    ax4.legend(loc="upper right", fontsize=8)
-    ax4.grid(True, alpha=0.3)
+    ax5.set_xlabel("MD-Schritt")
+    ax5.set_ylabel("mittlere Position (Å)")
+    ax5.legend(loc="upper right", fontsize=8)
+    ax5.grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(filepath, dpi=150)
@@ -825,7 +886,7 @@ class ThermalRamp:
                         material_id=material_id,
                         output_dir=cfg.debug_plot_dir,
                         early_stop_rel_std=cfg.early_stop_rel_std,
-                        pos_convergence_threshold=cfg.pos_convergence_threshold,
+                        pos_convergence_rel_std=cfg.pos_convergence_rel_std,
                         stopped_at=monitor.stopped_at,
                     )
                     logger.info("Debug-Plot gespeichert: %s", plot_path)
