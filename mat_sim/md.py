@@ -42,109 +42,208 @@ class _EquilibriumStop(Exception):
     """Wird ausgelöst, wenn das thermische Gleichgewicht frühzeitig erreicht ist."""
 
 
-# ── Equilibrium Monitor (ASE-Callback) ──────────────────────────────────────
-class _EquilibriumMonitor:
-    """Rotierendes Fenster über die kinetische Temperatur zur Gleichgewichtserkennung.
+# ── Kombinierter Gleichgewichts-Monitor (ASE-Callback) ─────────────────────
+class _CombinedEquilibriumMonitor:
+    """Kombinierter Gleichgewichts-Monitor: Temperatur + Rolling-Mean Positionen.
 
-    Wird als Callback an das ASE-Dynamics-Objekt angehängt.  Überwacht die
-    relative Standardabweichung der Temperatur innerhalb eines gleitenden
-    Fensters.  Sobald diese unter einen Schwellenwert fällt, wird
-    ``_EquilibriumStop`` ausgelöst, um ``dyn.run()`` kontrolliert abzubrechen.
+    Stoppt die MD nur, wenn **beide** Bedingungen erfüllt sind:
+
+    1. **Thermisches Gleichgewicht** – rel. Std-Abw. der Temperatur im
+       Rolling-Window < ``early_stop_rel_std``.
+    2. **Strukturelles Gleichgewicht** – Rolling-Mean der Positionen
+       konvergiert: aufeinanderfolgende Rolling-Means unterscheiden sich um
+       weniger als ``pos_convergence_threshold``.
+
+    Der Rolling-Mean passt sich automatisch an strukturelle Umordnungen an:
+    nach einem Phasenwechsel pendelt sich der Mean auf die neue Position ein,
+    und erst wenn er dort konvergiert, wird gestoppt.  Die alten Positionen
+    werden aus dem Fenster hinausgeschoben und verfälschen nicht das Ergebnis.
+
+    Die Fenstergröße für den Rolling-Mean wird adaptiv aus der
+    Schwingungsperiode bestimmt: Autokorrelation der Positionen → Periode →
+    Fenster = ``pos_convergence_window_mult`` × Periode.
+
+    Die vibrational MSD wird aus dem konvergierten Fenster berechnet
+    (drift-frei, ohne alte Positionen vor einem strukturellen Shift).
 
     Der Monitor wird **einmal** an das Dynamics-Objekt angehängt und vor
     jeder Temperaturstufe mit :meth:`reset` zurückgesetzt.
     """
 
-    def __init__(self, dyn, cfg: RampConfig) -> None:
+    def __init__(self, dyn, atoms: Atoms, cfg: RampConfig) -> None:
         self._dyn = dyn
-        self._min_steps = cfg.early_stop_min_steps
-        self._window_size = cfg.early_stop_window
-        self._rel_std_threshold = cfg.early_stop_rel_std
-        self._temperatures: list[float] = []
+        self._atoms = atoms
+
+        # Temperatur-Parameter
+        self._temp_min_steps = cfg.early_stop_min_steps
+        self._temp_window = cfg.early_stop_window
+        self._temp_rel_std = cfg.early_stop_rel_std
+
+        # Positions-Parameter
+        self._pos_sample_interval = max(cfg.msd_sample_interval, 1)
+        self._pos_min_samples = cfg.pos_convergence_min_samples
+        self._pos_window_mult = cfg.pos_convergence_window_mult
+        self._pos_min_window = cfg.pos_convergence_min_window
+        self._pos_threshold = cfg.pos_convergence_threshold
+
+        # Zustand
         self._step_count = 0
+        self._temperatures: list[float] = []
+        self._position_samples: list[np.ndarray] = []
+        self._temp_converged = False
+        self._pos_converged = False
         self._stopped_at: int | None = None
+        self._converged_window_size: int | None = None
+        self._period_samples: int | None = None
 
     # ── API ────────────────────────────────────────────────────────────
     def reset(self) -> None:
-        """Fenster und Zähler für eine neue Temperaturstufe zurücksetzen."""
-        self._temperatures.clear()
+        """Zustand für eine neue Temperaturstufe zurücksetzen."""
         self._step_count = 0
+        self._temperatures.clear()
+        self._position_samples.clear()
+        self._temp_converged = False
+        self._pos_converged = False
         self._stopped_at = None
+        self._converged_window_size = None
+        self._period_samples = None
 
     @property
     def stopped_at(self) -> int | None:
-        """Schritt-Index, bei dem das Gleichgewicht erkannt wurde, oder *None*."""
+        """MD-Schritt, bei dem das Gleichgewicht erkannt wurde, oder *None*."""
         return self._stopped_at
+
+    @property
+    def converged_samples(self) -> np.ndarray | None:
+        """Positionssamples aus dem konvergierten Fenster (für drift-freie MSD).
+
+        Gibt die letzten ``converged_window_size`` Samples zurück.
+        Fallback (keine Konvergenz): alle Samples.
+        """
+        if not self._position_samples:
+            return None
+        if self._converged_window_size is not None:
+            n = min(self._converged_window_size, len(self._position_samples))
+            return np.array(self._position_samples[-n:])
+        return np.array(self._position_samples)
+
+    @property
+    def samples(self) -> np.ndarray | None:
+        """Alle gesammelten Positionssamples (Kompatibilität)."""
+        if not self._position_samples:
+            return None
+        return np.array(self._position_samples)
 
     # ── ASE-Callback-Signatur ───────────────────────────────────────────
     def __call__(self) -> None:
         self._step_count += 1
 
-        # Aktuelle kinetische Temperatur aus dem Dynamics-Objekt auslesen
+        # Temperatur sammeln
         try:
             temp = self._dyn.get_temperature()
+            self._temperatures.append(float(temp))
+            if len(self._temperatures) > self._temp_window:
+                self._temperatures = self._temperatures[-self._temp_window:]
         except Exception:
-            return
+            pass
 
-        self._temperatures.append(float(temp))
-
-        # Fenster begrenzen
-        if len(self._temperatures) > self._window_size:
-            self._temperatures = self._temperatures[-self._window_size:]
+        # Positionen sammeln (alle pos_sample_interval Schritte)
+        if self._step_count % self._pos_sample_interval == 0:
+            self._position_samples.append(self._atoms.get_positions().copy())
 
         # Prüfung erst nach Mindestschritten
-        if self._step_count < self._min_steps:
+        if self._step_count < self._temp_min_steps:
             return
 
-        if len(self._temperatures) < self._window_size:
-            return
+        # ── 1. Temperatur-Konvergenz ──
+        if not self._temp_converged and len(self._temperatures) >= self._temp_window:
+            window = np.array(self._temperatures)
+            mean_t = np.mean(window)
+            if mean_t < 1.0:
+                # Bei T < 1 K ist die Temperaturkonvergenz trivial erfüllt.
+                self._temp_converged = True
+            elif mean_t > 1e-6:
+                rel_std = float(np.std(window) / mean_t)
+                if rel_std < self._temp_rel_std:
+                    self._temp_converged = True
 
-        window = np.array(self._temperatures)
-        mean_t = np.mean(window)
-        if mean_t <= 1e-6:
-            return
+        # ── 2. Positions-Konvergenz ──
+        if not self._pos_converged:
+            if len(self._position_samples) >= self._pos_min_samples:
+                self._pos_converged = self._check_position_convergence()
 
-        rel_std = float(np.std(window) / mean_t)
-
-        if rel_std < self._rel_std_threshold:
+        # ── 3. Beide konvergiert → Stop ──
+        if self._temp_converged and self._pos_converged:
             self._stopped_at = self._step_count
             raise _EquilibriumStop
 
+    # ── Positions-Konvergenz ────────────────────────────────────────────
+    def _check_position_convergence(self) -> bool:
+        """Rolling-Mean-Konvergenz der Positionen prüfen.
 
-# ── Position Collector (ASE-Callback) ──────────────────────────────────────
-class _PositionCollector:
-    """Sammelt Positionssnapshots während der Thermalisierung für vibrational MSD.
+        Vergleicht zwei aufeinanderfolgende Rolling-Means.  Wenn deren
+        RMS-Verschiebung unter dem Schwellwert liegt, ist das strukturelle
+        Gleichgewicht erreicht.
+        """
+        samples = np.array(self._position_samples)  # (n, N, 3)
+        n = len(samples)
 
-    Wird als Callback an das ASE-Dynamics-Objekt angehängt und sammelt alle
-    ``sample_interval`` Schritte eine Kopie der Atompositionen.  Die
-    gesammelten Positionen werden zur Berechnung der vibrational MSD verwendet
-    (Schwingungsamplitude um die Gleichgewichtsposition, nicht um 0 K-Positionen).
+        # Schwingungsperiode schätzen (einmalig pro T-Stufe)
+        if self._period_samples is None:
+            self._period_samples = self._estimate_oscillation_period(samples)
 
-    Vor jeder Temperaturstufe muss :meth:`reset` aufgerufen werden.
-    """
+        # Fenstergröße = mult × Periode, mindestens min_window
+        window = max(
+            self._pos_window_mult * self._period_samples,
+            self._pos_min_window,
+        )
+        window = min(window, n // 2)  # nicht mehr als die Hälfte der Samples
 
-    def __init__(self, atoms: Atoms, sample_interval: int = 10) -> None:
-        self._atoms = atoms
-        self._sample_interval = max(sample_interval, 1)
-        self._step_count = 0
-        self._samples: list[np.ndarray] = []
+        if window < 2 or n < 2 * window:
+            return False
 
-    def reset(self) -> None:
-        """Samples für eine neue Temperaturstufe zurücksetzen."""
-        self._step_count = 0
-        self._samples.clear()
+        mean_recent = np.mean(samples[-window:], axis=0)          # (N, 3)
+        mean_prev = np.mean(samples[-2 * window:-window], axis=0)  # (N, 3)
 
-    @property
-    def samples(self) -> np.ndarray | None:
-        """Array der Form ``(n_samples, N, 3)`` oder *None* wenn keine Samples."""
-        if not self._samples:
-            return None
-        return np.array(self._samples)
+        disp = mean_recent - mean_prev
+        rms_displacement = float(np.sqrt(np.mean(np.sum(disp**2, axis=1))))
 
-    def __call__(self) -> None:
-        self._step_count += 1
-        if self._step_count % self._sample_interval == 0:
-            self._samples.append(self._atoms.get_positions().copy())
+        if rms_displacement < self._pos_threshold:
+            self._converged_window_size = window
+            return True
+
+        return False
+
+    @staticmethod
+    def _estimate_oscillation_period(samples: np.ndarray) -> int:
+        """Schwingungsperiode (in Samples) aus Autokorrelation schätzen.
+
+        Verwendet die mittlere Position aller Atome als Signal und sucht
+        den ersten Nulldurchgang der normierten Autokorrelation.
+        Periode = 2 × Nulldurchgang.
+
+        Fallback bei zu wenigen Samples oder keinem Nulldurchgang: 5.
+        """
+        n = len(samples)
+        if n < 4:
+            return 5
+
+        # Kollektives Signal: mittlere Position pro Sample
+        signal = np.mean(samples, axis=1)  # (n, 3)
+        centered = signal - np.mean(signal, axis=0)
+
+        # Normierte Autokorrelation (gemittelt über x, y, z)
+        norm = float(np.sum(centered**2))
+        if norm < 1e-12:
+            return 5
+
+        for lag in range(1, n):
+            acf = float(np.sum(centered[:-lag] * centered[lag:]) / norm)
+            if acf <= 0:
+                return max(2 * lag, 2)
+
+        # Kein Nulldurchgang gefunden → Fallback
+        return 5
 
 
 # ── Konfiguration ───────────────────────────────────────────────────────────
@@ -177,6 +276,11 @@ class RampConfig:
     early_stop_rel_std: float = 0.02    # rel. Std-Abw.-Schwelle (2 %)
     # MSD-Sampling (vibrational MSD um Gleichgewichtsposition, nicht 0 K)
     msd_sample_interval: int = 10       # alle N MD-Schritte Positionen sampeln
+    # Positions-Konvergenz (Rolling-Mean)
+    pos_convergence_min_samples: int = 10   # Mindestsamples vor Prüfung
+    pos_convergence_window_mult: int = 3    # Fenster = mult × Schwingungsperiode
+    pos_convergence_min_window: int = 5     # Mindestfenstergröße
+    pos_convergence_threshold: float = 0.01 # RMS-Verschiebung < threshold → konvergiert (Å)
     # Persistenz für Zerfalls-Erkennung (Lindemann): MSD muss für N
     # aufeinanderfolgende Schritte über dem Schwellwert bleiben, bevor
     # abgebrochen wird.  Filtert transiente Spikes.
@@ -277,13 +381,9 @@ class ThermalRamp:
             loginterval=cfg.log_interval,
         )
 
-        # Early-Stopping-Monitor einmalig anhängen
-        monitor = _EquilibriumMonitor(dyn, cfg)
+        # Kombinierter Gleichgewichts-Monitor (Temperatur + Positionen)
+        monitor = _CombinedEquilibriumMonitor(dyn, self.atoms, cfg)
         dyn.attach(monitor, interval=1)
-
-        # Position-Collector für vibrational MSD
-        pos_collector = _PositionCollector(self.atoms, cfg.msd_sample_interval)
-        dyn.attach(pos_collector, interval=1)
 
         temperatures = np.arange(
             cfg.t_start, cfg.t_max + cfg.delta_t, cfg.delta_t
@@ -315,7 +415,6 @@ class ThermalRamp:
 
             # Thermalisieren (mit Profiling + Early Stopping)
             monitor.reset()
-            pos_collector.reset()
             t0 = time.perf_counter()
             early_stopped = False
             try:
@@ -330,7 +429,7 @@ class ThermalRamp:
 
             if early_stopped:
                 stopped_at = monitor.stopped_at or 0
-                print(f"   [INFO] Thermisches Gleichgewicht vorzeitig erreicht "
+                print(f"   [INFO] Gleichgewicht (Temp+Pos) vorzeitig erreicht "
                       f"bei Schritt {stopped_at}. Springe zur nächsten Temperatur.",
                       flush=True)
 
@@ -340,8 +439,8 @@ class ThermalRamp:
                 result.status = "diverged"
                 break
 
-            # Metriken sammeln
-            metrics = self._collect_metrics(T, initial_positions, pos_collector.samples)
+            # Metriken sammeln — konvergierte Samples bevorzugen (drift-frei)
+            metrics = self._collect_metrics(T, initial_positions, monitor.converged_samples)
             result.add(metrics)
 
             print(f"   [ERFOLG] T = {T:.1f} K nach {elapsed:.2f} Sekunden beendet. "
