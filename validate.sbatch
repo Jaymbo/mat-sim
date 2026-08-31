@@ -51,7 +51,7 @@ fi
 echo ""
 
 # ── Schritt 2: Mit neuen Parametern simulieren ─────────────────────────────
-echo "[$(date)] Schritt 2: Simulation (t_max=1200, therm_steps=1000, supercell≥50 Atome) …"
+echo "[$(date)] Schritt 2: Simulation (t_max=1200, therm_steps=1000, supercell≥50 Atome, debug-convergence) …"
 uv run python -m mat_sim.run \
     --db results.db \
     --device auto \
@@ -59,7 +59,8 @@ uv run python -m mat_sim.run \
     --t-max 1200 \
     --delta-t 50 \
     --therm-steps 1000 \
-    --supercell-min-atoms 50
+    --supercell-min-atoms 50 \
+    --debug-convergence
 
 SIM_EXIT=$?
 

@@ -227,6 +227,7 @@ def detect_t_switch(
     min_persistence: int = 3,
     relative_volume_change: float | None = None,
     volumes: Sequence[float] | None = None,
+    min_temperature: float = 100.0,
 ) -> float | None:
     """T_switch aus diskontinuierlichen RDF-Peak-Verschiebungen ableiten.
 
@@ -240,6 +241,9 @@ def detect_t_switch(
        Schwellwerts (verwirft transientes Rauschen).
     3. Optional: Wenn ``volumes`` übergeben wird, muss auch eine
        Volumenänderung > 5% um denselben Temperaturbereich auftreten.
+    4. **Mindesttemperatur**: Die Temperatur am Kandidaten muss ≥
+       ``min_temperature`` sein.  Verhindert Tieftemperatur-Artefakte
+       (z. B. RDF-Noise beim Einschwingen des Thermostats).
 
     Returns
     -------
@@ -257,6 +261,10 @@ def detect_t_switch(
     prev_shift = 0.0  # kumulierte Verschiebung seit Schritt 0
 
     for idx in range(1, len(rdf_history)):
+        # 4. Mindesttemperatur: Tieftemperatur-Artefakte ausschließen
+        if temperatures[idx] < min_temperature:
+            continue
+
         r, g = rdf_history[idx]
         peaks, _ = find_peaks(g, height=0.5, distance=5)
         curr_peak_pos = r[peaks] if peaks.size else np.array([])

@@ -339,6 +339,7 @@ def _run_recheck_switch(args: argparse.Namespace) -> int:
                 mat.rdf_history,
                 mat.temperatures,
                 volumes=mat.volumes,
+                min_temperature=100.0,
             )
             if new_t is not None:
                 n_rdf_based += 1

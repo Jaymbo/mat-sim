@@ -330,7 +330,7 @@ class RampConfig:
     # Early Stopping (thermisches Gleichgewicht)
     early_stop_min_steps: int = 20      # Mindestschritte, bevor Abbruch geprüft wird
     early_stop_window: int = 10         # Grösse des rotierenden Fensters
-    early_stop_rel_std: float = 0.02    # rel. Std-Abw.-Schwelle (2 %)
+    early_stop_rel_std: float = 0.05    # rel. Std-Abw.-Schwelle (5 %, NPT-tauglich)
     # MSD-Sampling (vibrational MSD um Gleichgewichtsposition, nicht 0 K)
     msd_sample_interval: int = 10       # alle N MD-Schritte Positionen sampeln
     # Positions-Konvergenz (Rolling-Mean)
@@ -695,6 +695,7 @@ class ThermalRamp:
                     result.rdf_history,
                     result.temperatures,
                     volumes=result.volumes,
+                    min_temperature=100.0,
                 )
             if result.t_switch is None and len(result.msd_values) >= 1:
                 result.t_switch = detect_t_switch_from_msd(
