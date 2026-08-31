@@ -13,7 +13,6 @@ Testet:
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from mat_sim.md import (
     RampConfig,
@@ -282,14 +281,14 @@ def test_estimate_oscillation_period_constant():
     """Konstante Positionen → Fallback (norm ≈ 0)."""
     samples = np.ones((10, 4, 3))
     period_est = _CombinedEquilibriumMonitor._estimate_oscillation_period(samples)
-    assert period_est == 5  # Fallback
+    assert period_est == 100  # Fallback (100 MD-Schritte = 100 fs)
 
 
 def test_estimate_oscillation_period_too_short():
     """Zu wenige Samples → Fallback."""
     samples = np.random.rand(3, 4, 3)
     period_est = _CombinedEquilibriumMonitor._estimate_oscillation_period(samples)
-    assert period_est == 5  # Fallback
+    assert period_est == 100  # Fallback (100 MD-Schritte = 100 fs)
 
 
 # ── 8. Reset funktioniert ─────────────────────────────────────────────────
@@ -434,3 +433,100 @@ def test_persistence_sustained_convergence_stops():
     assert stopped_at is not None
     # Stop erst nach persistence Schritten unter Schwelle
     assert stopped_at >= 10, f"Stop zu früh (stopped_at={stopped_at})"
+
+
+# ── 13. Nicht-sticky: eine Bedingung fällt weg → kein Stop ────────────────
+def test_non_sticky_temp_falls_away_no_stop():
+    """Temperatur konvergiert, Positionen konvergieren später — aber Temperatur
+    fällt vorher wieder weg → kein Stop.
+
+    Szenario: Temperatur stabil in Schritten 10–20 (konvergiert),
+    Positionen stabil ab Schritt 15.  Aber bei Schritt 25 fliegt die
+    Temperatur wieder hoch.  Da beide **im selben Schritt** konvergiert
+    sein müssen, sollte kein Stop passieren wenn die Temperatur weg ist.
+    """
+    cfg = _fast_cfg(
+        early_stop_min_steps=5,
+        early_stop_window=5,
+        pos_convergence_min_samples=6,
+        pos_convergence_min_window=3,
+        pos_convergence_persistence=3,
+    )
+    dyn = _FakeDyn()
+    atoms = _FakeAtoms(n_atoms=4)
+    monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
+
+    def temp_fn(step):
+        # Stabil 300K in Schritten 5–20, dann große Schwankung ab 21
+        if step <= 20:
+            return 300.0 + 0.1 * np.sin(step)
+        else:
+            return 300.0 + 50.0 * np.sin(step * 0.8)
+
+    def pos_fn(step):
+        # Stabil ab Schritt 8
+        p = np.zeros((4, 3))
+        if step <= 7:
+            p[:, 0] = 0.1 * step
+        else:
+            p[:, 0] = 1.0 + 0.0005 * np.sin(step)
+        return p
+
+    stopped, stopped_at = _run_monitor(monitor, 60, temp_fn, pos_fn)
+    # Positionen sind stabil ab Schritt 8, Temperatur stabil bis 20.
+    # Beide sind gleichzeitig konvergiert in Schritten ~11–20.
+    # Ein Stop in diesem Fenster ist korrekt.
+    # ABER: wenn der Stop in 11–20 nicht passiert (z.B. wegen Persistenz),
+    # und die Temperatur ab 21 weg ist, darf er danach nicht mehr stoppen.
+    if stopped:
+        assert stopped_at is not None
+        # Stop muss im Fenster passiert sein, wo beide konvergiert waren
+        assert stopped_at <= 20, (
+            f"Stop bei {stopped_at} — Temperatur war aber nur bis 20 konvergiert"
+        )
+
+
+# ── 14. Nicht-sticky: Positionen fallen weg → kein Stop ───────────────────
+def test_non_sticky_pos_falls_away_no_stop():
+    """Positionen konvergieren, Temperatur konvergiert später — aber Positionen
+    fallen vorher wieder weg → kein Stop.
+
+    Szenario: Positionen stabil in Schritten 8–20, Temperatur stabil ab 15.
+    Ab Schritt 21 driftet die Position wieder.  Stop nur wenn beide im
+    selben Schritt konvergiert sind.
+    """
+    cfg = _fast_cfg(
+        early_stop_min_steps=5,
+        early_stop_window=5,
+        pos_convergence_min_samples=6,
+        pos_convergence_min_window=3,
+        pos_convergence_persistence=3,
+    )
+    dyn = _FakeDyn()
+    atoms = _FakeAtoms(n_atoms=4)
+    monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
+
+    def temp_fn(step):
+        # Stabil ab Schritt 10
+        if step <= 9:
+            return 300.0 + 50.0 * np.exp(-step)
+        return 300.0 + 0.1 * np.sin(step)
+
+    def pos_fn(step):
+        # Stabil in Schritten 8–20, dann Drift ab 21
+        p = np.zeros((4, 3))
+        if 8 <= step <= 20:
+            p[:, 0] = 1.0 + 0.0005 * np.sin(step)
+        elif step > 20:
+            p[:, 0] = 1.0 + 0.1 * (step - 20)  # Drift
+        else:
+            p[:, 0] = 0.1 * step
+        return p
+
+    stopped, stopped_at = _run_monitor(monitor, 60, temp_fn, pos_fn)
+    if stopped:
+        assert stopped_at is not None
+        # Stop muss passieren, bevor Positionen wegdriften (≤ 20)
+        assert stopped_at <= 20, (
+            f"Stop bei {stopped_at} — Positionen waren aber nur bis 20 konvergiert"
+        )

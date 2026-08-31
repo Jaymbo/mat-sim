@@ -46,13 +46,18 @@ class _EquilibriumStop(Exception):
 class _CombinedEquilibriumMonitor:
     """Kombinierter Gleichgewichts-Monitor: Temperatur + Rolling-Mean Positionen.
 
-    Stoppt die MD nur, wenn **beide** Bedingungen erfüllt sind:
+    Stoppt die MD nur, wenn **beide Bedingungen im selben Schritt** erfüllt sind:
 
     1. **Thermisches Gleichgewicht** – rel. Std-Abw. der Temperatur im
        Rolling-Window < ``early_stop_rel_std``.
     2. **Strukturelles Gleichgewicht** – Rolling-Mean der Positionen
        konvergiert: aufeinanderfolgende Rolling-Means unterscheiden sich um
        weniger als ``pos_convergence_threshold``.
+
+    Beide Flags sind **nicht-sticky**: sie werden jeden Schritt neu
+    ausgewertet.  Wenn eine Bedingung in einem Schritt nicht mehr erfüllt
+    ist, wird sie wieder ``False``.  Ein Stop erfolgt nur, wenn beide
+    im selben Schritt ``True`` sind.
 
     Der Rolling-Mean passt sich automatisch an strukturelle Umordnungen an:
     nach einem Phasenwechsel pendelt sich der Mean auf die neue Position ein,
@@ -187,8 +192,9 @@ class _CombinedEquilibriumMonitor:
         # ── Konvergenz-Prüfung (erst nach Mindestschritten) ──
         past_min_steps = self._step_count >= self._temp_min_steps
 
-        # ── 1. Temperatur-Konvergenz ──
+        # ── 1. Temperatur-Konvergenz (nicht-sticky: jeden Schritt neu) ──
         temp_rel_std_val = float("nan")
+        self._temp_converged = False
         if past_min_steps and len(self._temperatures) >= self._temp_window:
             window = np.array(self._temperatures)
             mean_t = np.mean(window)
@@ -199,30 +205,34 @@ class _CombinedEquilibriumMonitor:
                 temp_rel_std_val = 1e-10
             elif mean_t > 1e-6:
                 temp_rel_std_val = float(np.std(window) / mean_t)
-                if temp_rel_std_val < self._temp_rel_std:
-                    self._temp_converged = True
+                self._temp_converged = temp_rel_std_val < self._temp_rel_std
 
-        # ── 2. Positions-Konvergenz (mit Persistenz) ──
+        # ── 2. Positions-Konvergenz (nicht-sticky, mit Persistenz) ──
+        #  Beide Flags werden jeden Schritt neu bewertet.  Ein Stop
+        #  erfolgt nur, wenn **beide im selben Schritt** True sind.
         pos_rms_val = float("nan")
+        self._pos_converged = False
         if past_min_steps and len(self._position_samples) >= self._pos_min_samples:
             pos_rms_val = self._compute_pos_rms()
-            if not self._pos_converged:
-                if np.isnan(pos_rms_val):
-                    self._pos_converged_count = 0
-                elif pos_rms_val < self._pos_threshold:
-                    self._pos_converged_count += 1
-                    if self._pos_converged_count >= self._pos_persistence:
-                        self._pos_converged = True
-                        # Fenstergröße für konvergierte Samples speichern
-                        n = len(self._position_samples)
-                        window = max(
-                            self._pos_window_mult * (self._period_samples or 5),
-                            self._pos_min_window,
-                        )
-                        window = min(window, n // 2)
-                        self._converged_window_size = window
-                else:
-                    self._pos_converged_count = 0
+            if np.isnan(pos_rms_val):
+                self._pos_converged_count = 0
+            elif pos_rms_val < self._pos_threshold:
+                self._pos_converged_count += 1
+            else:
+                self._pos_converged_count = 0
+
+            was_pos_converged = self._pos_converged
+            self._pos_converged = self._pos_converged_count >= self._pos_persistence
+
+            # Fenstergröße bei (Wieder-)Eintreten der Konvergenz setzen
+            if self._pos_converged and not was_pos_converged:
+                n = len(self._position_samples)
+                window = max(
+                    self._pos_window_mult * (self._period_samples or 100),
+                    self._pos_min_window,
+                )
+                window = min(window, n // 2)
+                self._converged_window_size = window
 
         # ── Debug-Historie aufzeichnen (jeder Schritt, nicht erst ab min_steps) ──
         self._history_steps.append(self._step_count)
@@ -272,11 +282,12 @@ class _CombinedEquilibriumMonitor:
         den ersten Nulldurchgang der normierten Autokorrelation.
         Periode = 2 × Nulldurchgang.
 
-        Fallback bei zu wenigen Samples oder keinem Nulldurchgang: 5.
+        Fallback bei zu wenigen Samples oder keinem Nulldurchgang: 100
+        (entspricht 100 MD-Schritten = 100 fs bei sample_interval=1).
         """
         n = len(samples)
         if n < 4:
-            return 5
+            return 100
 
         # Kollektives Signal: mittlere Position pro Sample
         signal = np.mean(samples, axis=1)  # (n, 3)
@@ -285,7 +296,7 @@ class _CombinedEquilibriumMonitor:
         # Normierte Autokorrelation (gemittelt über x, y, z)
         norm = float(np.sum(centered**2))
         if norm < 1e-12:
-            return 5
+            return 100
 
         for lag in range(1, n):
             acf = float(np.sum(centered[:-lag] * centered[lag:]) / norm)
@@ -293,7 +304,7 @@ class _CombinedEquilibriumMonitor:
                 return max(2 * lag, 2)
 
         # Kein Nulldurchgang gefunden → Fallback
-        return 5
+        return 100
 
 
 # ── Konfiguration ───────────────────────────────────────────────────────────
@@ -325,11 +336,11 @@ class RampConfig:
     early_stop_window: int = 100        # Grösse des rotierenden Fensters
     early_stop_rel_std: float = 0.05    # rel. Std-Abw.-Schwelle (5 %, NPT-tauglich)
     # MSD-Sampling (vibrational MSD um Gleichgewichtsposition, nicht 0 K)
-    msd_sample_interval: int = 10       # alle N MD-Schritte Positionen sampeln
+    msd_sample_interval: int = 1        # jeder MD-Schritt Positionen sampeln (präzise Autokorrelation)
     # Positions-Konvergenz (Rolling-Mean)
-    pos_convergence_min_samples: int = 20   # Mindestsamples vor Prüfung (20 × sample_interval = 200 MD-Schritte)
+    pos_convergence_min_samples: int = 100  # Mindestsamples vor Prüfung (= 100 MD-Schritte)
     pos_convergence_window_mult: int = 3    # Fenster = mult × Schwingungsperiode
-    pos_convergence_min_window: int = 5     # Mindestfenstergröße
+    pos_convergence_min_window: int = 100   # Mindestfenstergröße (100 Samples = 100 MD-Schritte = 100 fs)
     pos_convergence_threshold: float = 0.01 # RMS-Verschiebung < threshold → konvergiert (Å)
     pos_convergence_persistence: int = 5    # N aufeinanderfolgende Schritte unter Schwelle nötig
     # Persistenz für Zerfalls-Erkennung (Lindemann): MSD muss für N
