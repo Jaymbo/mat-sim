@@ -22,12 +22,14 @@ import os
 from dataclasses import dataclass
 from typing import Iterable
 
+import numpy as np
+
 from pymatgen.core import Structure
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from mp_api.client import MPRester
 
 from ase import Atoms
-from ase.build import niggli_reduce
+from ase.build import niggli_reduce, make_supercell
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +199,51 @@ def pmg_to_ase(structure: Structure) -> Atoms:
     niggli_reduce(atoms)
 
     return atoms
+
+
+def make_supercell_atoms(atoms: Atoms, min_atoms: int = 100) -> Atoms:
+    """Supercell aus einer primitiven Zelle erstellen.
+
+    Vergrößert die Zelle so, dass mindestens ``min_atoms`` Atome
+    enthalten sind.  Die Vergrößerung erfolgt isotrop (gleicher Faktor
+    in alle drei Richtungen), um Verzerrungen zu vermeiden.
+
+    Phasenübergänge in MD benötigen ausreichend große Zellen, damit
+    die neue Phase genügend Freiheitsgrade hat.  Primitive Zellen mit
+    < 50 Atomen sind für Phasenübergangssimulationen ungeeignet.
+
+    Parameters
+    ----------
+    atoms
+        Primitive (oder konventionelle) Zelle als ASE-Atoms.
+    min_atoms
+        Mindestanzahl Atome in der Supercell (Default: 100).
+
+    Returns
+    -------
+    Atoms
+        Supercell mit ≥ ``min_atoms`` Atomen.
+    """
+    n = len(atoms)
+    if n >= min_atoms:
+        return atoms
+
+    # Isotroper Faktor: kleinste ganze Zahl, die min_atoms erreicht
+    factor = 1
+    while n * factor**3 < min_atoms:
+        factor += 1
+
+    # Bei sehr kleinen Zellen kann factor groß werden → auf max 4 begrenzen
+    factor = min(factor, 4)
+
+    size = factor * np.eye(3, dtype=int)
+    supercell = make_supercell(atoms, size)
+
+    logger.info(
+        "Supercell: %d → %d Atome (Faktor %d×%d×%d)",
+        n, len(supercell), factor, factor, factor,
+    )
+    return supercell
 
 
 # ── Komfort-Funktion ────────────────────────────────────────────────────────

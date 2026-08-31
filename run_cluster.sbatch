@@ -41,7 +41,8 @@ uv run python -m mat_sim.run \
     --duration-min 25 \
     --t-max 1200 \
     --delta-t 20 \
-    --therm-steps 500
+    --therm-steps 5000 \
+    --supercell-min-atoms 100
 
 TRAIN_EXIT=$?
 

@@ -155,7 +155,7 @@ class RampConfig:
     t_start: float = 0.0            # K
     t_max: float = 1200.0           # K  (erhöht: deckt Übergänge bis ~1000 K ab)
     delta_t: float = 20.0           # K pro Schritt (20K → halbe Schrittzahl, 10K für feine Auflösung)
-    thermalization_steps: int = 500     # Zeitschritte pro T-Stufe (500 fs bei 1 fs/Step)
+    thermalization_steps: int = 5000    # Zeitschritte pro T-Stufe (5 ps bei 1 fs/Step)
     time_step: float = 1.0          # fs  (Standard für Oxid-MD)
     pressure: float = 1.0e-4        # GPa (≈ 1 atm)
     temperature_time_constant: float = 200.0 * fs   # τ_T (träge → stabil)

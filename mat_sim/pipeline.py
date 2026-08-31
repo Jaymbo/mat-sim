@@ -36,7 +36,7 @@ import numpy as np
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 
-from .acquisition import MPEntry, pmg_to_ase, query_mp_structures
+from .acquisition import MPEntry, make_supercell_atoms, pmg_to_ase, query_mp_structures
 from .calculator import get_calculator
 from .md import RampConfig, ThermalRamp
 from .metrics import TrajectoryResult
@@ -77,6 +77,7 @@ class PipelineConfig:
     db_path: str = "results.db"
     duration_min: int = 25  # SLURM Time-Out in Minuten
     stale_minutes: int = 30  # processing-Einträge älter als → reset
+    supercell_min_atoms: int = 100  # Mindestatomzahl für MD-Tauglichkeit
 
     def __post_init__(self) -> None:
         if self.ramp is None:
@@ -213,6 +214,9 @@ def run_pipeline(cfg: PipelineConfig) -> int:
                          queued.material_id, exc)
             mark_structure_error(cfg.db_path, queued.material_id)
             continue
+
+        # Supercell erstellen (falls primitive Zelle zu klein für Phasenübergänge)
+        atoms = make_supercell_atoms(atoms, min_atoms=cfg.supercell_min_atoms)
 
         # MD-Simulation
         deadline = time.perf_counter() + _time_remaining() - _TIMEOUT_BUFFER_S

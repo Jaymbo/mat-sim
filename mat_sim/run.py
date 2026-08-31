@@ -45,7 +45,8 @@ Optionen (Process)
     --device          cpu | cuda | auto  (Default: cpu)
     --t-max           Maximaltemperatur in K          (Default: 1200)
     --delta-t         Temperaturschritt in K          (Default: 20)
-    --therm-steps     Thermalisierungs-Schritte pro T (Default: 500)
+    --therm-steps     Thermalisierungs-Schritte pro T (Default: 5000)
+    --supercell-min-atoms  Mindestatomzahl für Supercell (Default: 100)
     --duration-min    Max. Laufzeit in Minuten (SLURM) (Default: 25)
     --stale-minutes   processing-Timeout für Reset    (Default: 30)
 
@@ -135,12 +136,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--t-max", type=float, default=1200.0,
                    help="Maximaltemperatur in K (Default: 1200)")
     p.add_argument("--delta-t", type=float, default=20.0)
-    p.add_argument("--therm-steps", type=int, default=500,
-                   help="Thermalisierungs-Schritte pro T-Stufe (Default: 500)")
+    p.add_argument("--therm-steps", type=int, default=5000,
+                   help="Thermalisierungs-Schritte pro T-Stufe (Default: 5000 = 5 ps)")
     p.add_argument("--duration-min", type=int, default=25,
                    help="Max. Laufzeit in Minuten (SLURM Time-Out-Handling, Default: 25)")
     p.add_argument("--stale-minutes", type=int, default=30,
                    help="processing-Einträge älter als N Min. → reset auf pending (Default: 30)")
+    p.add_argument("--supercell-min-atoms", type=int, default=100,
+                   help="Mindestatomzahl für Supercell (Default: 100, 0 = keine Supercell)")
 
     # ── Queue-Management ──
     p.add_argument("--queue-stats", action="store_true",
@@ -241,6 +244,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         db_path=args.db,
         duration_min=args.duration_min,
         stale_minutes=args.stale_minutes,
+        supercell_min_atoms=args.supercell_min_atoms,
     )
     return run_pipeline(cfg)
 
