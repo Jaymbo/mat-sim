@@ -184,19 +184,19 @@ class _CombinedEquilibriumMonitor:
         if self._step_count % self._pos_sample_interval == 0:
             self._position_samples.append(self._atoms.get_positions().copy())
 
-        # Prüfung erst nach Mindestschritten
-        if self._step_count < self._temp_min_steps:
-            return
+        # ── Konvergenz-Prüfung (erst nach Mindestschritten) ──
+        past_min_steps = self._step_count >= self._temp_min_steps
 
         # ── 1. Temperatur-Konvergenz ──
         temp_rel_std_val = float("nan")
-        if len(self._temperatures) >= self._temp_window:
+        if past_min_steps and len(self._temperatures) >= self._temp_window:
             window = np.array(self._temperatures)
             mean_t = np.mean(window)
             if mean_t < 1.0:
                 # Bei T < 1 K ist die Temperaturkonvergenz trivial erfüllt.
                 self._temp_converged = True
-                temp_rel_std_val = 0.0
+                # 1e-10 statt 0.0: im log-Plot sichtbar (log(0) = -∞)
+                temp_rel_std_val = 1e-10
             elif mean_t > 1e-6:
                 temp_rel_std_val = float(np.std(window) / mean_t)
                 if temp_rel_std_val < self._temp_rel_std:
@@ -204,7 +204,7 @@ class _CombinedEquilibriumMonitor:
 
         # ── 2. Positions-Konvergenz (mit Persistenz) ──
         pos_rms_val = float("nan")
-        if len(self._position_samples) >= self._pos_min_samples:
+        if past_min_steps and len(self._position_samples) >= self._pos_min_samples:
             pos_rms_val = self._compute_pos_rms()
             if not self._pos_converged:
                 if np.isnan(pos_rms_val):
@@ -224,7 +224,7 @@ class _CombinedEquilibriumMonitor:
                 else:
                     self._pos_converged_count = 0
 
-        # ── Debug-Historie aufzeichnen ──
+        # ── Debug-Historie aufzeichnen (jeder Schritt, nicht erst ab min_steps) ──
         self._history_steps.append(self._step_count)
         self._history_temp_rel_std.append(temp_rel_std_val)
         self._history_pos_rms.append(pos_rms_val)
@@ -321,13 +321,13 @@ class RampConfig:
     # Divergenz-Erkennung
     force_threshold: float = 100.0  # eV/Å – Kräfte darüber → Divergenz
     # Early Stopping (thermisches Gleichgewicht)
-    early_stop_min_steps: int = 20      # Mindestschritte, bevor Abbruch geprüft wird
-    early_stop_window: int = 10         # Grösse des rotierenden Fensters
+    early_stop_min_steps: int = 100     # Mindestschritte, bevor Abbruch geprüft wird
+    early_stop_window: int = 100        # Grösse des rotierenden Fensters
     early_stop_rel_std: float = 0.05    # rel. Std-Abw.-Schwelle (5 %, NPT-tauglich)
     # MSD-Sampling (vibrational MSD um Gleichgewichtsposition, nicht 0 K)
     msd_sample_interval: int = 10       # alle N MD-Schritte Positionen sampeln
     # Positions-Konvergenz (Rolling-Mean)
-    pos_convergence_min_samples: int = 10   # Mindestsamples vor Prüfung
+    pos_convergence_min_samples: int = 20   # Mindestsamples vor Prüfung (20 × sample_interval = 200 MD-Schritte)
     pos_convergence_window_mult: int = 3    # Fenster = mult × Schwingungsperiode
     pos_convergence_min_window: int = 5     # Mindestfenstergröße
     pos_convergence_threshold: float = 0.01 # RMS-Verschiebung < threshold → konvergiert (Å)
@@ -403,6 +403,11 @@ def save_convergence_plot(
     pos_rms = np.array(history["pos_rms"], dtype=float)
     temp_conv = np.array(history["temp_converged"], dtype=bool)
     pos_conv = np.array(history["pos_converged"], dtype=bool)
+
+    # 0-Werte auf kleine positive Zahl clippen (für log-Skala: log(0) = -∞)
+    _EPS = 1e-12
+    temp_rel_std = np.where(temp_rel_std == 0, _EPS, temp_rel_std)
+    pos_rms = np.where(pos_rms == 0, _EPS, pos_rms)
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
