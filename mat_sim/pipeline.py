@@ -77,7 +77,7 @@ class PipelineConfig:
     db_path: str = "results.db"
     duration_min: int = 25  # SLURM Time-Out in Minuten
     stale_minutes: int = 30  # processing-Einträge älter als → reset
-    supercell_min_atoms: int = 100  # Mindestatomzahl für MD-Tauglichkeit
+    supercell_min_atoms: int = 50  # Mindestatomzahl für MD-Tauglichkeit
 
     def __post_init__(self) -> None:
         if self.ramp is None:
