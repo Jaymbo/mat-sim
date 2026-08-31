@@ -359,8 +359,8 @@ class RampConfig:
     thermalization_steps: int = 1000    # Zeitschritte pro T-Stufe (1 ps bei 1 fs/Step)
     time_step: float = 1.0          # fs  (Standard für Oxid-MD)
     pressure: float = 1.0e-4        # GPa (≈ 1 atm)
-    temperature_time_constant: float = 50.0 * fs    # τ_T (kürzer → weniger Oszillation)
-    pressure_time_constant: float = 2000.0 * fs     # τ_P (sehr träge)
+    temperature_time_constant: float = 25.0 * fs    # τ_T (ASE-Empfehlung für Metalle)
+    pressure_time_constant: float = 500.0 * fs      # τ_P (kürzer → Barostat-Oszillation dämpft schneller)
     bulk_modulus: float = 100.0     # GPa (typisch für Übergangsmetall-Oxide)
     lindemann_fraction: float = 0.12
     rdf_r_max: float = 6.0
