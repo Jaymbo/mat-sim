@@ -38,6 +38,7 @@ class _FakeAtoms:
     def __init__(self, n_atoms: int = 4) -> None:
         self._positions = np.zeros((n_atoms, 3))
         self._temp = 300.0
+        self._volume = 1000.0
 
     def get_positions(self) -> np.ndarray:
         return self._positions.copy()
@@ -48,23 +49,30 @@ class _FakeAtoms:
     def get_temperature(self) -> float:
         return self._temp
 
+    def get_volume(self) -> float:
+        return self._volume
+
 
 def _run_monitor(
     monitor: _CombinedEquilibriumMonitor,
     n_steps: int,
     temp_fn,
     pos_fn,
+    vol_fn=None,
 ) -> tuple[bool, int | None]:
     """Führt den Monitor für n_steps Schritte aus.
 
-    Returns
-    -------
-    (stopped, stopped_at)
+    Parameters
+    ----------
+    vol_fn
+        Funktion ``(step) -> float`` für das Volumen.  Default: konstant 1000.
     """
     stopped = False
     for step in range(1, n_steps + 1):
         monitor._atoms._temp = temp_fn(step)
         monitor._atoms._positions = pos_fn(step)
+        if vol_fn is not None:
+            monitor._atoms._volume = vol_fn(step)
         try:
             monitor()
         except _EquilibriumStop:
@@ -88,6 +96,9 @@ def _fast_cfg(**overrides) -> RampConfig:
         pos_convergence_rel_std=0.10,
         pos_convergence_eval_window=10,
         pos_convergence_persistence=3,
+        vol_convergence_rel_std=0.02,
+        vol_convergence_eval_window=10,
+        vol_convergence_persistence=3,
     )
     defaults.update(overrides)
     return RampConfig(**defaults)
@@ -202,7 +213,9 @@ def test_finds_new_equilibrium_after_shift():
     assert stopped, "Sollte stoppen, nachdem neues Gleichgewicht gefunden"
     assert stopped_at is not None
     # Stop sollte erst nach der Stabilisierung (Schritt 15+) passieren
-    assert stopped_at >= 15, f"Stop darf nicht während des Shifts passieren (stopped_at={stopped_at})"
+    assert stopped_at >= 15, (
+        f"Stop darf nicht während des Shifts passieren (stopped_at={stopped_at})"
+    )
 
 
 # ── 5. konvergiertes Fenster liefert drift-freie Samples ──────────────────
@@ -236,8 +249,9 @@ def test_converged_samples_after_shift():
     assert conv is not None
     assert conv.shape[0] > 0
     # Alle konvergierten Samples sollten nahe der neuen Position (x≈1.0) sein
-    assert np.all(np.abs(conv[:, :, 0] - 1.0) < 0.2), \
+    assert np.all(np.abs(conv[:, :, 0] - 1.0) < 0.2), (
         "Konvergierte Samples sollten die neue Position widerspiegeln"
+    )
 
 
 # ── 6. Max-Steps als Safety-Cap ───────────────────────────────────────────
@@ -319,9 +333,11 @@ def test_reset_clears_state():
     assert len(monitor._position_samples) == 0
     assert monitor._temp_converged is False
     assert monitor._pos_converged is False
+    assert monitor._vol_converged is False
     assert monitor._stopped_at is None
     assert monitor._converged_window_size is None
     assert monitor._period_samples is None
+    assert len(monitor._volumes) == 0
 
 
 # ── 9. Tieftemperatur: Temperaturkonvergenz trivial ───────────────────────
@@ -520,7 +536,9 @@ def test_non_sticky_pos_falls_away_no_stop():
         if 8 <= step <= 20:
             p[:, 0] = 1.0 + 0.0005 * np.sin(step)
         elif step > 20:
-            p[:, 0] = 1.0 + 0.5 * (step - 20)  # Drift (schnell genug für pos_rms > ceiling)
+            p[:, 0] = 1.0 + 0.5 * (
+                step - 20
+            )  # Drift (schnell genug für pos_rms > ceiling)
         else:
             p[:, 0] = 0.1 * step
         return p
@@ -532,3 +550,71 @@ def test_non_sticky_pos_falls_away_no_stop():
         assert stopped_at <= 20, (
             f"Stop bei {stopped_at} — Positionen waren aber nur bis 20 konvergiert"
         )
+
+
+# ── 15. Volumen nicht konvergiert → kein Stop ─────────────────────────────
+def test_volume_not_converged_prevents_stop():
+    """Temp + Pos konvergiert, aber Volumen oszilliert → kein Stop.
+
+    Szenario: Konstante Temperatur, konstante Positionen, aber das
+    Volumen oszilliert mit großer Amplitude (Barostat-Artefakt).
+    Der Stop darf nicht passieren, solange das Volumen nicht konvergiert ist.
+    """
+    cfg = _fast_cfg(
+        vol_convergence_rel_std=0.01,  # strenge Schwelle
+        vol_convergence_eval_window=10,
+        vol_convergence_persistence=3,
+    )
+    dyn = _FakeDyn()
+    atoms = _FakeAtoms(n_atoms=4)
+    monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
+
+    def temp_fn(step):
+        return 300.0
+
+    def pos_fn(step):
+        p = np.zeros((4, 3))
+        p[:, 0] = 1.0 + 0.001 * np.sin(step * 0.3)
+        return p
+
+    def vol_fn(step):
+        # ±10% Oszillation → rel. Std >> 1%
+        return 1000.0 + 100.0 * np.sin(step * 0.5)
+
+    stopped, _ = _run_monitor(monitor, 200, temp_fn, pos_fn, vol_fn)
+    assert not stopped, "Sollte nicht stoppen — Volumen noch in Oszillation"
+
+
+# ── 16. Alle drei konvergiert → Stop ──────────────────────────────────────
+def test_all_three_converged_stops():
+    """Temp + Pos + Vol alle konvergiert → Stop.
+
+    Szenario: Konstante Temperatur, konstante Positionen, konstantes Volumen.
+    Alle drei Bedingungen erfüllt → Stop nach eval_window + persistence.
+    """
+    cfg = _fast_cfg(
+        vol_convergence_rel_std=0.02,
+        vol_convergence_eval_window=10,
+        vol_convergence_persistence=3,
+    )
+    dyn = _FakeDyn()
+    atoms = _FakeAtoms(n_atoms=4)
+    monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
+
+    def temp_fn(step):
+        return 300.0
+
+    def pos_fn(step):
+        p = np.zeros((4, 3))
+        p[:, 0] = 1.0 + 0.001 * np.sin(step * 0.3)
+        return p
+
+    def vol_fn(step):
+        # Konstantes Volumen mit minimalem Rauschen (< 2% rel. Std)
+        return 1000.0 + 0.5 * np.sin(step)
+
+    stopped, stopped_at = _run_monitor(monitor, 200, temp_fn, pos_fn, vol_fn)
+    assert stopped, "Sollte stoppen — alle drei Bedingungen erfüllt"
+    assert stopped_at is not None
+    # Vol braucht mindestens eval_window(10) + persistence(3) - 1 = 12 Schritte
+    assert stopped_at >= 12, f"Stop zu früh (stopped_at={stopped_at})"

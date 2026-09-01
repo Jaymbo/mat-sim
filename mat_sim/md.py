@@ -47,9 +47,9 @@ class _EquilibriumStop(Exception):
 
 # ── Kombinierter Gleichgewichts-Monitor (ASE-Callback) ─────────────────────
 class _CombinedEquilibriumMonitor:
-    """Kombinierter Gleichgewichts-Monitor: Temperatur + Rolling-Mean Positionen.
+    """Kombinierter Gleichgewichts-Monitor: Temperatur + Positionen + Volumen.
 
-    Stoppt die MD nur, wenn **beide Bedingungen im selben Schritt** erfüllt sind:
+    Stoppt die MD nur, wenn **alle drei Bedingungen im selben Schritt** erfüllt sind:
 
     1. **Thermisches Gleichgewicht** – rel. Std-Abw. der Temperatur im
        Rolling-Window < ``early_stop_rel_std`` (10 %, über natürlicher
@@ -59,11 +59,15 @@ class _CombinedEquilibriumMonitor:
        über einem Auswertefenster < ``pos_convergence_rel_std`` (10 %).
        Ein absoluter Schwellwert funktioniert nicht, weil pos_rms mit T
        skaliert (thermische Vibration ~ sqrt(T/N)).
+    3. **Volumen-Gleichgewicht** – rel. Std-Abw. des Volumens über
+       ``vol_convergence_eval_window`` < ``vol_convergence_rel_std`` (2 %).
+       Verhindert, dass der Barostat mid-oscillation gesamplet wird
+       (Periode ~500 Steps bei τ_P=100 fs → ±5% Volumen-Rauschen).
 
-    Beide Flags sind **nicht-sticky**: sie werden jeden Schritt neu
+    Alle Flags sind **nicht-sticky**: sie werden jeden Schritt neu
     ausgewertet.  Wenn eine Bedingung in einem Schritt nicht mehr erfüllt
-    ist, wird sie wieder ``False``.  Ein Stop erfolgt nur, wenn beide
-    im selben Schritt ``True`` sind.
+    ist, wird sie wieder ``False``.  Ein Stop erfolgt nur, wenn alle
+    drei im selben Schritt ``True`` sind.
 
     Der Rolling-Mean passt sich automatisch an strukturelle Umordnungen an:
     nach einem Phasenwechsel pendelt sich der Mean auf die neue Position ein,
@@ -101,16 +105,27 @@ class _CombinedEquilibriumMonitor:
         self._pos_eval_window = cfg.pos_convergence_eval_window
         self._pos_persistence = max(cfg.pos_convergence_persistence, 1)
 
+        # Volumen-Parameter
+        self._vol_rel_std = cfg.vol_convergence_rel_std
+        self._vol_eval_window = cfg.vol_convergence_eval_window
+        self._vol_persistence = max(cfg.vol_convergence_persistence, 1)
+
         # Zustand
         self._step_count = 0
         self._temperatures: list[float] = []
         self._position_samples: list[np.ndarray] = []
         self._temp_converged = False
         self._pos_converged = False
-        self._pos_converged_count = 0   # aufeinanderfolgende Schritte unter Schwelle
+        self._pos_converged_count = 0  # aufeinanderfolgende Schritte unter Schwelle
         self._stopped_at: int | None = None
         self._converged_window_size: int | None = None
         self._period_samples: int | None = None
+
+        # Volumen-Zustand
+        self._volumes: list[float] = []  # Roh-Volumen jeden Step
+        self._vol_rolling_means: list[float] = []  # Rolling-Mean des Volumens
+        self._vol_converged = False
+        self._vol_converged_count = 0
 
         # Debug-Historie (pro T-Stufe)
         self._history_steps: list[int] = []
@@ -119,11 +134,15 @@ class _CombinedEquilibriumMonitor:
         self._history_pos_rel_std: list[float] = []
         self._history_temp_converged: list[bool] = []
         self._history_pos_converged: list[bool] = []
+        self._history_vol_rel_std: list[float] = []
+        self._history_vol_converged: list[bool] = []
 
         # Rohdaten (jeder Schritt, für interaktive Plots / Frequenzanalyse)
         self._raw_steps: list[int] = []
         self._raw_temperatures: list[float] = []
-        self._raw_mean_pos: list[list[float]] = []  # [x, y, z] mittlere Position aller Atome
+        self._raw_mean_pos: list[
+            list[float]
+        ] = []  # [x, y, z] mittlere Position aller Atome
 
     # ── API ────────────────────────────────────────────────────────────
     def reset(self) -> None:
@@ -137,12 +156,18 @@ class _CombinedEquilibriumMonitor:
         self._stopped_at = None
         self._converged_window_size = None
         self._period_samples = None
+        self._volumes.clear()
+        self._vol_rolling_means.clear()
+        self._vol_converged = False
+        self._vol_converged_count = 0
         self._history_steps.clear()
         self._history_temp_rel_std.clear()
         self._history_pos_rms.clear()
         self._history_pos_rel_std.clear()
         self._history_temp_converged.clear()
         self._history_pos_converged.clear()
+        self._history_vol_rel_std.clear()
+        self._history_vol_converged.clear()
         self._raw_steps.clear()
         self._raw_temperatures.clear()
         self._raw_mean_pos.clear()
@@ -181,7 +206,8 @@ class _CombinedEquilibriumMonitor:
         -------
         dict
             Schlüssel: ``steps``, ``temp_rel_std``, ``pos_rms``,
-            ``pos_rel_std``, ``temp_converged``, ``pos_converged``.
+            ``pos_rel_std``, ``temp_converged``, ``pos_converged``,
+            ``vol_rel_std``, ``vol_converged``.
         """
         return {
             "steps": list(self._history_steps),
@@ -190,6 +216,8 @@ class _CombinedEquilibriumMonitor:
             "pos_rel_std": list(self._history_pos_rel_std),
             "temp_converged": list(self._history_temp_converged),
             "pos_converged": list(self._history_pos_converged),
+            "vol_rel_std": list(self._history_vol_rel_std),
+            "vol_converged": list(self._history_vol_converged),
         }
 
     @property
@@ -202,12 +230,14 @@ class _CombinedEquilibriumMonitor:
         Returns
         -------
         dict
-            Schlüssel: ``steps``, ``temperatures``, ``mean_pos`` (x/y/z).
+            Schlüssel: ``steps``, ``temperatures``, ``mean_pos`` (x/y/z),
+            ``volumes``.
         """
         return {
             "steps": list(self._raw_steps),
             "temperatures": list(self._raw_temperatures),
             "mean_pos": list(self._raw_mean_pos),
+            "volumes": list(self._volumes),
         }
 
     # ── ASE-Callback-Signatur ───────────────────────────────────────────
@@ -220,13 +250,20 @@ class _CombinedEquilibriumMonitor:
             temp = self._atoms.get_temperature()
             self._temperatures.append(float(temp))
             if len(self._temperatures) > self._temp_window:
-                self._temperatures = self._temperatures[-self._temp_window:]
+                self._temperatures = self._temperatures[-self._temp_window :]
         except Exception:
             pass
 
         # Positionen sammeln (alle pos_sample_interval Schritte)
         if self._step_count % self._pos_sample_interval == 0:
             self._position_samples.append(self._atoms.get_positions().copy())
+
+        # Volumen sammeln (jeder Schritt — O(1) über Zellvektoren)
+        try:
+            vol = float(self._atoms.get_volume())
+        except Exception:
+            vol = float("nan")
+        self._volumes.append(vol)
 
         # ── Rohdaten aufzeichnen (jeder Schritt, für interaktive Plots) ──
         self._raw_steps.append(self._step_count)
@@ -263,10 +300,33 @@ class _CombinedEquilibriumMonitor:
         #  Schwellwert funktioniert nicht, weil pos_rms mit T skaliert
         #  (thermische Vibration der mittleren Position ~ sqrt(T/N)).
         #  Beide Flags werden jeden Schritt neu bewertet.
+        #
+        #  Sonderfall T < 1 K: Keine thermische Bewegung, die Struktur
+        #  wurde bereits durch LBFGS optimiert.  Die pos_rms-Oszillation
+        #  bei 0 K ist ein reiner Barostat-Artefakt (Periode ~2500 Schritte,
+        #  viel länger als eval_window).  → Positionen trivial konvergiert.
         pos_rms_val = float("nan")
         pos_rel_std_val = float("nan")
         self._pos_converged = False
-        if past_min_steps and len(self._position_samples) >= self._pos_min_samples:
+        if (
+            past_min_steps
+            and len(self._temperatures) > 0
+            and np.mean(self._temperatures) < 1.0
+        ):
+            # T < 1 K → Positionen trivial konvergiert (wie Temperatur)
+            self._pos_converged = True
+            pos_rel_std_val = 1e-10
+            self._history_pos_rms.append(pos_rms_val)  # NaN
+            # Fenstergröße setzen (für converged_samples / vibrational MSD)
+            if self._converged_window_size is None:
+                n = len(self._position_samples)
+                window = max(
+                    self._pos_window_mult * (self._period_samples or 100),
+                    self._pos_min_window,
+                )
+                window = min(window, n // 2) if n > 0 else self._pos_min_window
+                self._converged_window_size = window
+        elif past_min_steps and len(self._position_samples) >= self._pos_min_samples:
             pos_rms_val = self._compute_pos_rms()
             self._history_pos_rms.append(pos_rms_val)
 
@@ -284,8 +344,11 @@ class _CombinedEquilibriumMonitor:
             if pos_below_floor:
                 # Sehr kleine Verschiebung → direkt als konvergiert werten
                 pos_rel_std_val = 0.0
-            elif pos_below_ceiling and len(self._history_pos_rms) >= self._pos_eval_window:
-                eval_data = np.array(self._history_pos_rms[-self._pos_eval_window:])
+            elif (
+                pos_below_ceiling
+                and len(self._history_pos_rms) >= self._pos_eval_window
+            ):
+                eval_data = np.array(self._history_pos_rms[-self._pos_eval_window :])
                 mean_pr = np.mean(eval_data)
                 if mean_pr > 1e-12:
                     pos_rel_std_val = float(np.std(eval_data) / mean_pr)
@@ -314,16 +377,47 @@ class _CombinedEquilibriumMonitor:
         else:
             self._history_pos_rms.append(pos_rms_val)
 
+        # ── 2b. Volumen-Konvergenz (Plateau-Erkennung) ──
+        #  Der Barostat oszilliert mit Periode ~500 Steps (bei τ_P=100 fs).
+        #  rel. Std-Abw. des Volumens über eval_window muss < 2% sein,
+        #  damit die Simulation nicht stoppt, während das Volumen noch
+        #  mid-oscillation ist (verhindert ±5% Volumen-Sprünge zwischen
+        #  T-Stufen, die RDF/Q4-Artefakte erzeugen).
+        vol_rel_std_val = float("nan")
+        self._vol_converged = False
+        if (
+            past_min_steps
+            and len(self._temperatures) > 0
+            and np.mean(self._temperatures) < 1.0
+        ):
+            # T < 1 K → Volumen trivial konvergiert (wie Temperatur/Positionen)
+            self._vol_converged = True
+            vol_rel_std_val = 1e-10
+        elif past_min_steps and len(self._volumes) >= self._vol_eval_window:
+            vol_window = np.array(self._volumes[-self._vol_eval_window :])
+            mean_v = float(np.mean(vol_window))
+            if mean_v > 1e-12:
+                vol_rel_std_val = float(np.std(vol_window) / mean_v)
+            if np.isnan(vol_rel_std_val):
+                self._vol_converged_count = 0
+            elif vol_rel_std_val < self._vol_rel_std:
+                self._vol_converged_count += 1
+            else:
+                self._vol_converged_count = 0
+            self._vol_converged = self._vol_converged_count >= self._vol_persistence
+
         # ── Debug-Historie aufzeichnen (jeder Schritt, nicht erst ab min_steps) ──
         # pos_rms wurde bereits im Konvergenz-Block an _history_pos_rms angefügt.
         self._history_steps.append(self._step_count)
         self._history_temp_rel_std.append(temp_rel_std_val)
         self._history_pos_rel_std.append(pos_rel_std_val)
+        self._history_vol_rel_std.append(vol_rel_std_val)
         self._history_temp_converged.append(self._temp_converged)
         self._history_pos_converged.append(self._pos_converged)
+        self._history_vol_converged.append(self._vol_converged)
 
-        # ── 3. Beide konvergiert → Stop ──
-        if self._temp_converged and self._pos_converged:
+        # ── 3. Alle drei konvergiert → Stop ──
+        if self._temp_converged and self._pos_converged and self._vol_converged:
             self._stopped_at = self._step_count
             raise _EquilibriumStop
 
@@ -351,7 +445,7 @@ class _CombinedEquilibriumMonitor:
             return float("nan")
 
         mean_recent = np.mean(samples[-window:], axis=0)
-        mean_prev = np.mean(samples[-2 * window:-window], axis=0)
+        mean_prev = np.mean(samples[-2 * window : -window], axis=0)
         disp = mean_recent - mean_prev
         return float(np.sqrt(np.mean(np.sum(disp**2, axis=1))))
 
@@ -393,40 +487,74 @@ class _CombinedEquilibriumMonitor:
 class RampConfig:
     """Parameter für die Temperaturrampe."""
 
-    t_start: float = 0.0            # K
-    t_max: float = 1200.0           # K  (erhöht: deckt Übergänge bis ~1000 K ab)
-    delta_t: float = 20.0           # K pro Schritt (20K → halbe Schrittzahl, 10K für feine Auflösung)
-    thermalization_steps: int = 1000    # Zeitschritte pro T-Stufe (1 ps bei 1 fs/Step)
-    time_step: float = 1.0          # fs  (Standard für Oxid-MD)
-    pressure: float = 1.0e-4        # GPa (≈ 1 atm)
-    temperature_time_constant: float = 25.0 * fs    # τ_T (ASE-Empfehlung für Metalle)
-    pressure_time_constant: float = 500.0 * fs      # τ_P (kürzer → Barostat-Oszillation dämpft schneller)
-    bulk_modulus: float = 100.0     # GPa (typisch für Übergangsmetall-Oxide)
+    t_start: float = 0.0  # K
+    t_max: float = 1200.0  # K  (erhöht: deckt Übergänge bis ~1000 K ab)
+    delta_t: float = (
+        20.0  # K pro Schritt (20K → halbe Schrittzahl, 10K für feine Auflösung)
+    )
+    thermalization_steps: int = 1000  # Zeitschritte pro T-Stufe (1 ps bei 1 fs/Step)
+    time_step: float = 1.0  # fs  (Standard für Oxid-MD)
+    pressure: float = 1.0e-4  # GPa (≈ 1 atm)
+    temperature_time_constant: float = 25.0 * fs  # τ_T (ASE-Empfehlung für Metalle)
+    pressure_time_constant: float = (
+        100.0 * fs
+    )  # τ_P (kurz → Barostat-Periode ~500 Steps, dämpft schnell)
+    bulk_modulus: float = 100.0  # GPa (typisch für Übergangsmetall-Oxide)
     lindemann_fraction: float = 0.12
     rdf_r_max: float = 6.0
     rdf_n_bins: int = 100
     log_interval: int = 50
-    checkpoint_interval: int = 5    # alle N Temperaturschritte einen Checkpoint speichern
+    checkpoint_interval: int = 5  # alle N Temperaturschritte einen Checkpoint speichern
     # Geometrieoptimierung
-    fmax: float = 0.05              # eV/Å – Schwellwert für BFGS
-    opt_max_steps: int = 200        # Max. Optimierungs-Schritte
+    fmax: float = 0.05  # eV/Å – Schwellwert für BFGS
+    opt_max_steps: int = 200  # Max. Optimierungs-Schritte
     # Divergenz-Erkennung
     force_threshold: float = 100.0  # eV/Å – Kräfte darüber → Divergenz
     # Early Stopping (thermisches Gleichgewicht)
-    early_stop_min_steps: int = 100     # Mindestschritte, bevor Abbruch geprüft wird
-    early_stop_window: int = 100        # Grösse des rotierenden Fensters
-    early_stop_rel_std: float = 0.10    # rel. Std-Abw.-Schwelle (10 %, über NVT-Fluktuation von 7.2 % für N=128)
+    early_stop_min_steps: int = 100  # Mindestschritte, bevor Abbruch geprüft wird
+    early_stop_window: int = 100  # Grösse des rotierenden Fensters
+    early_stop_rel_std: float = (
+        0.10  # rel. Std-Abw.-Schwelle (10 %, über NVT-Fluktuation von 7.2 % für N=128)
+    )
     # MSD-Sampling (vibrational MSD um Gleichgewichtsposition, nicht 0 K)
-    msd_sample_interval: int = 1        # jeder MD-Schritt Positionen sampeln (präzise Autokorrelation)
+    msd_sample_interval: int = (
+        1  # jeder MD-Schritt Positionen sampeln (präzise Autokorrelation)
+    )
     # Positions-Konvergenz (Rolling-Mean + Plateau-Erkennung)
-    pos_convergence_min_samples: int = 100  # Mindestsamples vor Prüfung (= 100 MD-Schritte)
-    pos_convergence_window_mult: int = 3    # Fenster = mult × Schwingungsperiode
-    pos_convergence_min_window: int = 100   # Mindestfenstergröße (100 Samples = 100 MD-Schritte = 100 fs)
-    pos_convergence_threshold: float = 0.5  # Absoluter Ceiling für pos_rms (verhindert Drift-Konvergenz)
-    pos_convergence_floor: float = 0.001   # Absoluter Floor: pos_rms < floor → konvergiert (skip rel-std)
-    pos_convergence_rel_std: float = 0.10   # Plateau-Erkennung: rel. Std von pos_rms über eval_window < 10 %
-    pos_convergence_eval_window: int = 500  # Fenster für Plateau-Erkennung (500 MD-Schritte)
-    pos_convergence_persistence: int = 5    # N aufeinanderfolgende Schritte unter Schwelle nötig
+    pos_convergence_min_samples: int = (
+        100  # Mindestsamples vor Prüfung (= 100 MD-Schritte)
+    )
+    pos_convergence_window_mult: int = 3  # Fenster = mult × Schwingungsperiode
+    pos_convergence_min_window: int = (
+        100  # Mindestfenstergröße (100 Samples = 100 MD-Schritte = 100 fs)
+    )
+    pos_convergence_threshold: float = (
+        0.5  # Absoluter Ceiling für pos_rms (verhindert Drift-Konvergenz)
+    )
+    pos_convergence_floor: float = (
+        0.001  # Absoluter Floor: pos_rms < floor → konvergiert (skip rel-std)
+    )
+    pos_convergence_rel_std: float = (
+        0.10  # Plateau-Erkennung: rel. Std von pos_rms über eval_window < 10 %
+    )
+    pos_convergence_eval_window: int = (
+        500  # Fenster für Plateau-Erkennung (500 MD-Schritte)
+    )
+    pos_convergence_persistence: int = (
+        5  # N aufeinanderfolgende Schritte unter Schwelle nötig
+    )
+    # Volumen-Konvergenz (Rolling-Mean + Plateau-Erkennung, analog pos_rms)
+    # Verhindert, dass die Simulation stoppt, während der Barostat noch
+    # oszilliert (Periode ~500 Steps bei τ_P=100 fs).  Ohne Volumen-Check
+    # würde das Volumen mid-oscillation gesamplet → ±5% Rauschen →
+    # RDF/Q4/Volumen-Sprünge sind Artefakte, keine Phasenübergänge.
+    vol_convergence_rel_std: float = 0.02  # Plateau: rel. Std des Vol-rolling-mean < 2%
+    vol_convergence_eval_window: int = (
+        500  # Fenster für Plateau-Erkennung (500 MD-Schritte)
+    )
+    vol_convergence_persistence: int = (
+        5  # N aufeinanderfolgende Schritte unter Schwelle nötig
+    )
     # Persistenz für Zerfalls-Erkennung (Lindemann): MSD muss für N
     # aufeinanderfolgende Schritte über dem Schwellwert bleiben, bevor
     # abgebrochen wird.  Filtert transiente Spikes.
@@ -503,18 +631,18 @@ def save_raw_data_json(
         "raw": {
             "steps": raw_data["steps"],
             "temperatures": [_clean(t) for t in raw_data["temperatures"]],
-            "mean_pos": [
-                [_clean(c) for c in pos]
-                for pos in raw_data["mean_pos"]
-            ],
+            "mean_pos": [[_clean(c) for c in pos] for pos in raw_data["mean_pos"]],
+            "volumes": [_clean(v) for v in raw_data.get("volumes", [])],
         },
         "history": {
             "steps": history["steps"],
             "temp_rel_std": [_clean(v) for v in history["temp_rel_std"]],
             "pos_rms": [_clean(v) for v in history["pos_rms"]],
             "pos_rel_std": [_clean(v) for v in history["pos_rel_std"]],
+            "vol_rel_std": [_clean(v) for v in history.get("vol_rel_std", [])],
             "temp_converged": history["temp_converged"],
             "pos_converged": history["pos_converged"],
+            "vol_converged": history.get("vol_converged", []),
         },
     }
 
@@ -534,16 +662,18 @@ def save_convergence_plot(
     output_dir: str,
     early_stop_rel_std: float,
     pos_convergence_rel_std: float,
+    vol_convergence_rel_std: float,
     stopped_at: int | None,
 ) -> str:
     """Konvergenz-Verlauf als PNG speichern (headless, matplotlib Agg-Backend).
 
-    Erzeugt **fünf** Subplots:
+    Erzeugt **sechs** Subplots:
       1. Temperatur rel. Std-Abw. über MD-Schritten mit Schwellwert-Linie
       2. Positions-RMS-Verschiebung über MD-Schritten
       3. Positions-Plateau: rel. Std von pos_rms mit Schwellwert-Linie
-      4. Roh-Temperatur über MD-Schritten (jeder Schritt)
-      5. Roh mittlere Position (x/y/z) über MD-Schritten
+      4. Volumen-Plateau: rel. Std des Volumens mit Schwellwert-Linie
+      5. Roh-Temperatur über MD-Schritten (jeder Schritt)
+      6. Roh mittlere Position (x/y/z) über MD-Schritten
 
     Parameters
     ----------
@@ -573,6 +703,7 @@ def save_convergence_plot(
         Pfad zur gespeicherten PNG-Datei.
     """
     import matplotlib
+
     matplotlib.use("Agg")  # headless
     import matplotlib.pyplot as plt
     from pathlib import Path
@@ -589,36 +720,54 @@ def save_convergence_plot(
     temp_rel_std = np.array(history["temp_rel_std"], dtype=float)
     pos_rms = np.array(history["pos_rms"], dtype=float)
     pos_rel_std = np.array(history.get("pos_rel_std", []), dtype=float)
+    vol_rel_std = np.array(history.get("vol_rel_std", []), dtype=float)
     temp_conv = np.array(history["temp_converged"], dtype=bool)
     pos_conv = np.array(history["pos_converged"], dtype=bool)
+    vol_conv = np.array(history.get("vol_converged", []), dtype=bool)
 
     # 0-Werte auf kleine positive Zahl clippen (für log-Skala: log(0) = -∞)
     _EPS = 1e-12
     temp_rel_std = np.where(temp_rel_std == 0, _EPS, temp_rel_std)
     pos_rms = np.where(pos_rms == 0, _EPS, pos_rms)
     pos_rel_std = np.where(pos_rel_std == 0, _EPS, pos_rel_std)
+    vol_rel_std = np.where(vol_rel_std == 0, _EPS, vol_rel_std)
 
     # Rohdaten extrahieren
     raw_steps = np.array(raw_data["steps"], dtype=float)
     raw_temps = np.array(raw_data["temperatures"], dtype=float)
     raw_mean_pos = np.array(raw_data["mean_pos"], dtype=float)  # (n_steps, 3)
 
-    fig, axes = plt.subplots(5, 1, figsize=(10, 17), sharex=True)
-    ax1, ax2, ax3, ax4, ax5 = axes
+    fig, axes = plt.subplots(6, 1, figsize=(10, 20), sharex=True)
+    ax1, ax2, ax3, ax4, ax5, ax6 = axes
 
     # ── Subplot 1: Temperatur rel. Std ──
     valid_temp = ~np.isnan(temp_rel_std)
     if np.any(valid_temp):
-        ax1.plot(steps[valid_temp], temp_rel_std[valid_temp],
-                 "b-", linewidth=0.8, label="rel. Std (Temperatur)")
-    ax1.axhline(y=early_stop_rel_std, color="r", linestyle="--",
-                linewidth=0.8, label=f"Schwelle ({early_stop_rel_std:.2f})")
+        ax1.plot(
+            steps[valid_temp],
+            temp_rel_std[valid_temp],
+            "b-",
+            linewidth=0.8,
+            label="rel. Std (Temperatur)",
+        )
+    ax1.axhline(
+        y=early_stop_rel_std,
+        color="r",
+        linestyle="--",
+        linewidth=0.8,
+        label=f"Schwelle ({early_stop_rel_std:.2f})",
+    )
     # Konvergenz-Zeitpunkt markieren
     temp_conv_idx = np.where(temp_conv)[0]
     if len(temp_conv_idx) > 0:
         first_conv = temp_conv_idx[0]
-        ax1.axvline(x=steps[first_conv], color="g", linestyle=":",
-                    linewidth=1.0, label=f"konvergiert (Schritt {int(steps[first_conv])})")
+        ax1.axvline(
+            x=steps[first_conv],
+            color="g",
+            linestyle=":",
+            linewidth=1.0,
+            label=f"konvergiert (Schritt {int(steps[first_conv])})",
+        )
     ax1.set_ylabel("rel. Std-Abw.\n(Temperatur)")
     ax1.set_title(f"{formula} ({material_id}) — T = {temperature:.1f} K")
     ax1.legend(loc="upper right", fontsize=8)
@@ -628,17 +777,32 @@ def save_convergence_plot(
     # ── Subplot 2: Positions-RMS (raw) ──
     valid_pos = ~np.isnan(pos_rms)
     if np.any(valid_pos):
-        ax2.plot(steps[valid_pos], pos_rms[valid_pos],
-                 "b-", linewidth=0.8, label="RMS (Rolling-Mean Positionen)")
+        ax2.plot(
+            steps[valid_pos],
+            pos_rms[valid_pos],
+            "b-",
+            linewidth=0.8,
+            label="RMS (Rolling-Mean Positionen)",
+        )
     pos_conv_idx = np.where(pos_conv)[0]
     if len(pos_conv_idx) > 0:
         first_conv = pos_conv_idx[0]
-        ax2.axvline(x=steps[first_conv], color="g", linestyle=":",
-                    linewidth=1.0, label=f"konvergiert (Schritt {int(steps[first_conv])})")
+        ax2.axvline(
+            x=steps[first_conv],
+            color="g",
+            linestyle=":",
+            linewidth=1.0,
+            label=f"konvergiert (Schritt {int(steps[first_conv])})",
+        )
     # Early-Stop markieren
     if stopped_at is not None:
-        ax2.axvline(x=stopped_at, color="orange", linestyle="-",
-                    linewidth=1.5, label=f"Stop (Schritt {stopped_at})")
+        ax2.axvline(
+            x=stopped_at,
+            color="orange",
+            linestyle="-",
+            linewidth=1.5,
+            label=f"Stop (Schritt {stopped_at})",
+        )
     ax2.set_ylabel("RMS-Verschiebung\n(Å)")
     ax2.legend(loc="upper right", fontsize=8)
     ax2.set_yscale("log")
@@ -648,36 +812,107 @@ def save_convergence_plot(
     if len(pos_rel_std) == len(steps):
         valid_prs = ~np.isnan(pos_rel_std)
         if np.any(valid_prs):
-            ax3.plot(steps[valid_prs], pos_rel_std[valid_prs],
-                     "b-", linewidth=0.8, label="rel. Std (pos_rms)")
-    ax3.axhline(y=pos_convergence_rel_std, color="r", linestyle="--",
-                linewidth=0.8, label=f"Schwelle ({pos_convergence_rel_std:.2f})")
+            ax3.plot(
+                steps[valid_prs],
+                pos_rel_std[valid_prs],
+                "b-",
+                linewidth=0.8,
+                label="rel. Std (pos_rms)",
+            )
+    ax3.axhline(
+        y=pos_convergence_rel_std,
+        color="r",
+        linestyle="--",
+        linewidth=0.8,
+        label=f"Schwelle ({pos_convergence_rel_std:.2f})",
+    )
     if len(pos_conv_idx) > 0:
         first_conv = pos_conv_idx[0]
-        ax3.axvline(x=steps[first_conv], color="g", linestyle=":",
-                    linewidth=1.0, label=f"konvergiert (Schritt {int(steps[first_conv])})")
+        ax3.axvline(
+            x=steps[first_conv],
+            color="g",
+            linestyle=":",
+            linewidth=1.0,
+            label=f"konvergiert (Schritt {int(steps[first_conv])})",
+        )
     if stopped_at is not None:
-        ax3.axvline(x=stopped_at, color="orange", linestyle="-",
-                    linewidth=1.5, label=f"Stop (Schritt {stopped_at})")
+        ax3.axvline(
+            x=stopped_at,
+            color="orange",
+            linestyle="-",
+            linewidth=1.5,
+            label=f"Stop (Schritt {stopped_at})",
+        )
     ax3.set_ylabel("rel. Std (pos_rms)")
     ax3.legend(loc="upper right", fontsize=8)
     ax3.set_yscale("log")
     ax3.grid(True, alpha=0.3)
 
-    # ── Subplot 4: Roh-Temperatur über Schritten ──
+    # ── Subplot 4: Volumen-Plateau (rel. Std des Volumens) ──
+    if len(vol_rel_std) == len(steps):
+        valid_vrs = ~np.isnan(vol_rel_std)
+        if np.any(valid_vrs):
+            ax4.plot(
+                steps[valid_vrs],
+                vol_rel_std[valid_vrs],
+                "b-",
+                linewidth=0.8,
+                label="rel. Std (Volumen)",
+            )
+    ax4.axhline(
+        y=vol_convergence_rel_std,
+        color="r",
+        linestyle="--",
+        linewidth=0.8,
+        label=f"Schwelle ({vol_convergence_rel_std:.3f})",
+    )
+    vol_conv_idx = np.where(vol_conv)[0]
+    if len(vol_conv_idx) > 0:
+        first_conv = vol_conv_idx[0]
+        ax4.axvline(
+            x=steps[first_conv],
+            color="g",
+            linestyle=":",
+            linewidth=1.0,
+            label=f"konvergiert (Schritt {int(steps[first_conv])})",
+        )
+    if stopped_at is not None:
+        ax4.axvline(
+            x=stopped_at,
+            color="orange",
+            linestyle="-",
+            linewidth=1.5,
+            label=f"Stop (Schritt {stopped_at})",
+        )
+    ax4.set_ylabel("rel. Std (Volumen)")
+    ax4.legend(loc="upper right", fontsize=8)
+    ax4.set_yscale("log")
+    ax4.grid(True, alpha=0.3)
+
+    # ── Subplot 5: Roh-Temperatur über Schritten ──
     if len(raw_steps) > 0:
         valid_raw_t = ~np.isnan(raw_temps)
         if np.any(valid_raw_t):
-            ax4.plot(raw_steps[valid_raw_t], raw_temps[valid_raw_t],
-                     "b-", linewidth=0.6, label="T (roh)")
+            ax5.plot(
+                raw_steps[valid_raw_t],
+                raw_temps[valid_raw_t],
+                "b-",
+                linewidth=0.6,
+                label="T (roh)",
+            )
     if stopped_at is not None:
-        ax4.axvline(x=stopped_at, color="orange", linestyle="-",
-                    linewidth=1.5, label=f"Stop ({stopped_at})")
-    ax4.set_ylabel("Temperatur (K)")
-    ax4.legend(loc="upper right", fontsize=8)
-    ax4.grid(True, alpha=0.3)
+        ax5.axvline(
+            x=stopped_at,
+            color="orange",
+            linestyle="-",
+            linewidth=1.5,
+            label=f"Stop ({stopped_at})",
+        )
+    ax5.set_ylabel("Temperatur (K)")
+    ax5.legend(loc="upper right", fontsize=8)
+    ax5.grid(True, alpha=0.3)
 
-    # ── Subplot 5: Roh mittlere Position (x/y/z) über Schritten ──
+    # ── Subplot 6: Roh mittlere Position (x/y/z) über Schritten ──
     if len(raw_steps) > 0 and raw_mean_pos.shape[0] > 0:
         labels = ["x", "y", "z"]
         colors = ["r", "g", "b"]
@@ -685,16 +920,25 @@ def save_convergence_plot(
             vals = raw_mean_pos[:, dim]
             valid = ~np.isnan(vals)
             if np.any(valid):
-                ax5.plot(raw_steps[valid], vals[valid],
-                         color=colors[dim], linewidth=0.6,
-                         label=f"mean {labels[dim]}")
+                ax6.plot(
+                    raw_steps[valid],
+                    vals[valid],
+                    color=colors[dim],
+                    linewidth=0.6,
+                    label=f"mean {labels[dim]}",
+                )
     if stopped_at is not None:
-        ax5.axvline(x=stopped_at, color="orange", linestyle="-",
-                    linewidth=1.5, label=f"Stop ({stopped_at})")
-    ax5.set_xlabel("MD-Schritt")
-    ax5.set_ylabel("mittlere Position (Å)")
-    ax5.legend(loc="upper right", fontsize=8)
-    ax5.grid(True, alpha=0.3)
+        ax6.axvline(
+            x=stopped_at,
+            color="orange",
+            linestyle="-",
+            linewidth=1.5,
+            label=f"Stop ({stopped_at})",
+        )
+    ax6.set_xlabel("MD-Schritt")
+    ax6.set_ylabel("mittlere Position (Å)")
+    ax6.legend(loc="upper right", fontsize=8)
+    ax6.grid(True, alpha=0.3)
 
     fig.tight_layout()
     fig.savefig(filepath, dpi=150)
@@ -794,18 +1038,16 @@ class ThermalRamp:
         # Kombinierter Gleichgewichts-Monitor (wird pro T-Stufe neu ans dyn gehängt)
         monitor = _CombinedEquilibriumMonitor(None, self.atoms, cfg)
 
-        temperatures = np.arange(
-            cfg.t_start, cfg.t_max + cfg.delta_t, cfg.delta_t
-        )
+        temperatures = np.arange(cfg.t_start, cfg.t_max + cfg.delta_t, cfg.delta_t)
 
         # Beim Resume: ab resume_step+1 weitermachen
         if resume_step > 0:
-            temperatures = temperatures[resume_step + 1:]
+            temperatures = temperatures[resume_step + 1 :]
 
         # --- Schritt 3: Temperaturschleife --------------------------------
         n_steps_total = len(temperatures)
         timed_out = False
-        decay_consecutive = 0        # aufeinanderfolgende Schritte über Lindemann-Schwelle
+        decay_consecutive = 0  # aufeinanderfolgende Schritte über Lindemann-Schwelle
         decay_temp_candidate: float | None = None  # T des ersten Überschreitens
 
         for i, T in enumerate(temperatures):
@@ -818,8 +1060,11 @@ class ThermalRamp:
                 result.status = "diverged"
                 break
 
-            print(f"-> Starte MD-Simulation für T = {T:.1f} K ... "
-                  f"(Schritt {global_step}/{resume_step + n_steps_total})", flush=True)
+            print(
+                f"-> Starte MD-Simulation für T = {T:.1f} K ... "
+                f"(Schritt {global_step}/{resume_step + n_steps_total})",
+                flush=True,
+            )
 
             # ── Neues NPT-Objekt pro T-Stufe ──
             # Verhindert, dass der Nosé-Hoover-Thermostat-Zustand (zeta)
@@ -857,9 +1102,11 @@ class ThermalRamp:
 
             if early_stopped:
                 stopped_at = monitor.stopped_at or 0
-                print(f"   [INFO] Gleichgewicht (Temp+Pos) vorzeitig erreicht "
-                      f"bei Schritt {stopped_at}. Springe zur nächsten Temperatur.",
-                      flush=True)
+                print(
+                    f"   [INFO] Gleichgewicht (Temp+Pos+Vol) vorzeitig erreicht "
+                    f"bei Schritt {stopped_at}. Springe zur nächsten Temperatur.",
+                    flush=True,
+                )
 
             # Divergenz-Check NACH dem MD-Schritt
             if self._check_divergence():
@@ -868,11 +1115,16 @@ class ThermalRamp:
                 break
 
             # Metriken sammeln — konvergierte Samples bevorzugen (drift-frei)
-            metrics = self._collect_metrics(T, initial_positions, monitor.converged_samples)
+            metrics = self._collect_metrics(
+                T, initial_positions, monitor.converged_samples
+            )
             result.add(metrics)
 
-            print(f"   [ERFOLG] T = {T:.1f} K nach {elapsed:.2f} Sekunden beendet. "
-                  f"(MSD: {metrics.msd:.4f})", flush=True)
+            print(
+                f"   [ERFOLG] T = {T:.1f} K nach {elapsed:.2f} Sekunden beendet. "
+                f"(MSD: {metrics.msd:.4f})",
+                flush=True,
+            )
 
             # ── Debug: Konvergenz-Plot + Rohdaten-JSON speichern ──
             if cfg.debug_convergence_plots:
@@ -887,6 +1139,7 @@ class ThermalRamp:
                         output_dir=cfg.debug_plot_dir,
                         early_stop_rel_std=cfg.early_stop_rel_std,
                         pos_convergence_rel_std=cfg.pos_convergence_rel_std,
+                        vol_convergence_rel_std=cfg.vol_convergence_rel_std,
                         stopped_at=monitor.stopped_at,
                     )
                     logger.info("Debug-Plot gespeichert: %s", plot_path)
@@ -912,7 +1165,8 @@ class ThermalRamp:
             if deadline is not None and time.perf_counter() > deadline:
                 logger.warning(
                     "Deadline erreicht nach T=%.1f K (Schritt %d) — breche ab.",
-                    T, global_step,
+                    T,
+                    global_step,
                 )
                 # Finaler Checkpoint vor Abbruch (auch wenn nicht Intervall-Schritt)
                 if checkpoint_cb is not None and not is_interval_step:
@@ -936,7 +1190,8 @@ class ThermalRamp:
                         logger.warning(
                             "Zerfall detektiert bei T=%.1f K "
                             "(nach %d konsekutiven Schritten) – Abbruch.",
-                            decay_temp_candidate, decay_consecutive,
+                            decay_temp_candidate,
+                            decay_consecutive,
                         )
                         print(
                             f"   [WARNUNG] Zerfall detektiert bei T = "

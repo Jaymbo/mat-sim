@@ -27,12 +27,16 @@ class _FakeAtoms:
     def __init__(self, n_atoms: int = 4) -> None:
         self._positions = np.zeros((n_atoms, 3))
         self._temp = 300.0
+        self._volume = 1000.0
 
     def get_positions(self) -> np.ndarray:
         return self._positions.copy()
 
     def get_temperature(self) -> float:
         return self._temp
+
+    def get_volume(self) -> float:
+        return self._volume
 
 
 def _fast_cfg(**overrides) -> RampConfig:
@@ -48,6 +52,9 @@ def _fast_cfg(**overrides) -> RampConfig:
         pos_convergence_rel_std=0.10,
         pos_convergence_eval_window=10,
         pos_convergence_persistence=3,
+        vol_convergence_rel_std=0.02,
+        vol_convergence_eval_window=10,
+        vol_convergence_persistence=3,
     )
     defaults.update(overrides)
     return RampConfig(**defaults)
@@ -79,6 +86,8 @@ def test_history_recorded():
     assert len(hist["pos_rel_std"]) == len(hist["steps"])
     assert len(hist["temp_converged"]) == len(hist["steps"])
     assert len(hist["pos_converged"]) == len(hist["steps"])
+    assert len(hist["vol_rel_std"]) == len(hist["steps"])
+    assert len(hist["vol_converged"]) == len(hist["steps"])
 
     # temp_rel_std sollte endliche Werte haben (nach min_steps)
     valid = [v for v in hist["temp_rel_std"] if not np.isnan(v)]
@@ -111,33 +120,156 @@ def test_save_convergence_plot_creates_png(tmp_path):
     """save_convergence_plot erzeugt eine PNG-Datei."""
     history = {
         "steps": list(range(5, 50)),
-        "temp_rel_std": [0.1, 0.08, 0.06, 0.04, 0.03, 0.02, 0.02, 0.02,
-                         0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
-                         0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
-                         0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
-                         0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
-                         0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
-                         0.02, 0.02],
-        "pos_rms": [float("nan"), float("nan"), 0.1, 0.05, 0.03,
-                    0.02, 0.015, 0.01, 0.008, 0.007, 0.006, 0.005,
-                    0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005,
-                    0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005,
-                    0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005,
-                    0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005,
-                    0.005, 0.005, 0.005, 0.005, 0.005],
-        "pos_rel_std": [float("nan")] * 2 + [0.2, 0.15, 0.1, 0.08, 0.06,
-                    0.05, 0.04, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03,
-                    0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03,
-                    0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03,
-                    0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03,
-                    0.03, 0.03, 0.03, 0.03, 0.03, 0.03],
+        "temp_rel_std": [
+            0.1,
+            0.08,
+            0.06,
+            0.04,
+            0.03,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+            0.02,
+        ],
+        "pos_rms": [
+            float("nan"),
+            float("nan"),
+            0.1,
+            0.05,
+            0.03,
+            0.02,
+            0.015,
+            0.01,
+            0.008,
+            0.007,
+            0.006,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+            0.005,
+        ],
+        "pos_rel_std": [float("nan")] * 2
+        + [
+            0.2,
+            0.15,
+            0.1,
+            0.08,
+            0.06,
+            0.05,
+            0.04,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+            0.03,
+        ],
         "temp_converged": [False] * 4 + [True] * 41,
         "pos_converged": [False] * 6 + [True] * 39,
+        "vol_rel_std": [float("nan")] * 10 + [0.01] * 35,
+        "vol_converged": [False] * 13 + [True] * 32,
     }
     raw_data = {
         "steps": list(range(1, 50)),
         "temperatures": [340.0 + 0.1 * math.sin(s) for s in range(1, 50)],
         "mean_pos": [[1.0 + 0.001 * s, 0.0, 0.0] for s in range(1, 50)],
+        "volumes": [1000.0 + 0.5 * math.sin(s) for s in range(1, 50)],
     }
 
     filepath = save_convergence_plot(
@@ -149,6 +281,7 @@ def test_save_convergence_plot_creates_png(tmp_path):
         output_dir=str(tmp_path),
         early_stop_rel_std=0.02,
         pos_convergence_rel_std=0.01,
+        vol_convergence_rel_std=0.02,
         stopped_at=45,
     )
 
@@ -168,12 +301,20 @@ def test_save_convergence_plot_nan_heavy(tmp_path):
         "pos_rel_std": [float("nan")] * 5,
         "temp_converged": [False, False, False, False, True],
         "pos_converged": [False] * 5,
+        "vol_rel_std": [float("nan")] * 5,
+        "vol_converged": [False] * 5,
     }
     raw_data = {
         "steps": [1, 2, 3, 4, 5],
         "temperatures": [float("nan"), float("nan"), 300.0, 300.0, 300.0],
-        "mean_pos": [[float("nan")] * 3, [float("nan")] * 3,
-                     [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        "mean_pos": [
+            [float("nan")] * 3,
+            [float("nan")] * 3,
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        "volumes": [float("nan"), float("nan"), 1000.0, 1000.0, 1000.0],
     }
 
     filepath = save_convergence_plot(
@@ -185,6 +326,7 @@ def test_save_convergence_plot_nan_heavy(tmp_path):
         output_dir=str(tmp_path),
         early_stop_rel_std=0.02,
         pos_convergence_rel_std=0.01,
+        vol_convergence_rel_std=0.02,
         stopped_at=None,
     )
 
@@ -201,11 +343,14 @@ def test_save_convergence_plot_creates_subdirectory(tmp_path):
         "pos_rel_std": [float("nan"), 0.05],
         "temp_converged": [False, True],
         "pos_converged": [False, True],
+        "vol_rel_std": [float("nan"), 0.01],
+        "vol_converged": [False, True],
     }
     raw_data = {
         "steps": [1, 2],
         "temperatures": [100.0, 100.0],
         "mean_pos": [[0.5, 0.0, 0.0], [0.5, 0.0, 0.0]],
+        "volumes": [1000.0, 1000.0],
     }
 
     filepath = save_convergence_plot(
@@ -217,6 +362,7 @@ def test_save_convergence_plot_creates_subdirectory(tmp_path):
         output_dir=str(tmp_path),
         early_stop_rel_std=0.02,
         pos_convergence_rel_std=0.01,
+        vol_convergence_rel_std=0.02,
         stopped_at=2,
     )
 
@@ -248,6 +394,7 @@ def test_raw_data_recorded():
     assert len(raw["steps"]) > 0
     assert len(raw["temperatures"]) == len(raw["steps"])
     assert len(raw["mean_pos"]) == len(raw["steps"])
+    assert len(raw["volumes"]) == len(raw["steps"])
     # Jeder mean_pos-Eintrag hat 3 Koordinaten
     assert all(len(pos) == 3 for pos in raw["mean_pos"])
     # Temperaturen sollten endliche Werte haben
@@ -275,6 +422,7 @@ def test_raw_data_cleared_on_reset():
     assert len(monitor.raw_data["steps"]) == 0
     assert len(monitor.raw_data["temperatures"]) == 0
     assert len(monitor.raw_data["mean_pos"]) == 0
+    assert len(monitor.raw_data["volumes"]) == 0
 
 
 # ── 4. save_raw_data_json ─────────────────────────────────────────────────
@@ -287,11 +435,14 @@ def test_save_raw_data_json_creates_file(tmp_path):
         "pos_rel_std": [float("nan"), 0.15, 0.03],
         "temp_converged": [False, False, True],
         "pos_converged": [False, False, True],
+        "vol_rel_std": [float("nan"), 0.02, 0.01],
+        "vol_converged": [False, False, True],
     }
     raw_data = {
         "steps": [1, 2, 3],
         "temperatures": [float("nan"), 300.0, 300.0],
         "mean_pos": [[float("nan"), 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        "volumes": [float("nan"), 1000.0, 1000.0],
     }
 
     filepath = save_raw_data_json(
@@ -332,6 +483,7 @@ def test_save_raw_data_json_stopped_at_none(tmp_path):
         "steps": [1],
         "temperatures": [300.0],
         "mean_pos": [[0.0, 0.0, 0.0]],
+        "volumes": [1000.0],
     }
     history = {
         "steps": [1],
@@ -340,6 +492,8 @@ def test_save_raw_data_json_stopped_at_none(tmp_path):
         "pos_rel_std": [float("nan")],
         "temp_converged": [False],
         "pos_converged": [False],
+        "vol_rel_std": [float("nan")],
+        "vol_converged": [False],
     }
 
     filepath = save_raw_data_json(
