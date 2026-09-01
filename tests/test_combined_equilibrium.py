@@ -106,19 +106,27 @@ def _fast_cfg(**overrides) -> RampConfig:
 
 # ── 1. Nur Temperatur konvergiert → kein Stop ─────────────────────────────
 def test_temp_converged_pos_not_stops():
-    """Temperatur ist stabil, aber Positionen verschieben sich → kein Stop."""
+    """Temperatur ist stabil, aber Positionen verschieben sich → kein Stop.
+
+    Die Atome verschieben sich **unterschiedlich** (keine reine Translation),
+    so dass die interne Struktur tatsächlich wandelt.
+    """
     cfg = _fast_cfg()
     dyn = _FakeDyn()
     atoms = _FakeAtoms(n_atoms=4)
     monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
 
-    # Konstante Temperatur, aber linear driftende Positionen
+    # Konstante Temperatur, aber unterschiedlich driftende Positionen
     def temp_fn(step):
         return 300.0
 
     def pos_fn(step):
         p = np.zeros((4, 3))
-        p[:, 0] = step * 0.1  # ständige Verschiebung
+        # Jedes Atom driftet mit unterschiedlicher Rate → interne Struktur ändert sich
+        p[0, 0] = step * 0.1
+        p[1, 0] = step * 0.2
+        p[2, 0] = step * 0.05
+        p[3, 0] = step * 0.15
         return p
 
     stopped, _ = _run_monitor(monitor, 200, temp_fn, pos_fn)
@@ -187,26 +195,37 @@ def test_finds_new_equilibrium_after_shift():
     Szenario: Start bei Position x=0, dann allmählicher Shift zu x=1,
     dann Stabilisierung bei x=1. Der Rolling-Mean soll konvergieren,
     sobald die neue Position stabil ist.
+
+    Die Atome verschieben sich **unterschiedlich** (nicht-uniform),
+    so dass die interne Struktur tatsächlich wandelt.
     """
     cfg = _fast_cfg(pos_convergence_min_samples=6, pos_convergence_min_window=3)
     dyn = _FakeDyn()
     atoms = _FakeAtoms(n_atoms=4)
     monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
 
+    # Basis-Struktur: 4 Atome in einem Quadrat
+    base = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float)
+    # Ziel-Struktur: Atome verschieben sich unterschiedlich (intern)
+    target = np.array([[0.5, 0, 0], [1.2, 0, 0], [0, 1.3, 0], [1.1, 1.1, 0]])
+
     def temp_fn(step):
         return 340.0  # konstant
 
     def pos_fn(step):
-        p = np.zeros((4, 3))
-        # Phase 1 (Schritte 1-5): lineare Verschiebung 0→0.5
+        p = base.copy()
+        # Phase 1 (Schritte 1-5): allmählicher interner Shift
         if step <= 5:
-            p[:, 0] = 0.1 * step
-        # Phase 2 (Schritte 6-15): weiterer Shift 0.5→1.0
+            frac = step / 5.0
+            p = base + frac * (target - base)
+        # Phase 2 (Schritte 6-15): weiterer Shift
         elif step <= 15:
-            p[:, 0] = 0.5 + 0.05 * (step - 5)
-        # Phase 3 (Schritte 16+): stabil bei 1.0
+            frac = (step - 5) / 10.0
+            p = base + (0.5 + 0.5 * frac) * (target - base)
+        # Phase 3 (Schritte 16+): stabil bei target
         else:
-            p[:, 0] = 1.0 + 0.001 * np.sin(step)
+            p = target.copy()
+            p[:, 0] += 0.001 * np.sin(step)
         return p
 
     stopped, stopped_at = _run_monitor(monitor, 100, temp_fn, pos_fn)
@@ -226,20 +245,23 @@ def test_converged_samples_after_shift():
     atoms = _FakeAtoms(n_atoms=4)
     monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
 
+    base = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float)
+    target = np.array([[0.5, 0, 0], [1.2, 0, 0], [0, 1.3, 0], [1.1, 1.1, 0]])
+
     def temp_fn(step):
         return 300.0
 
     def pos_fn(step):
-        p = np.zeros((4, 3))
-        # Phase 1 (Schritte 1-5): lineare Verschiebung 0→0.5
+        p = base.copy()
         if step <= 5:
-            p[:, 0] = 0.1 * step
-        # Phase 2 (Schritte 6-15): weiterer Shift 0.5→1.0
+            frac = step / 5.0
+            p = base + frac * (target - base)
         elif step <= 15:
-            p[:, 0] = 0.5 + 0.05 * (step - 5)
-        # Phase 3 (Schritte 16+): stabil bei 1.0
+            frac = (step - 5) / 10.0
+            p = base + (0.5 + 0.5 * frac) * (target - base)
         else:
-            p[:, 0] = 1.0 + 0.001 * np.sin(step)
+            p = target.copy()
+            p[:, 0] += 0.001 * np.sin(step)
         return p
 
     stopped, _ = _run_monitor(monitor, 100, temp_fn, pos_fn)
@@ -248,10 +270,11 @@ def test_converged_samples_after_shift():
     conv = monitor.converged_samples
     assert conv is not None
     assert conv.shape[0] > 0
-    # Alle konvergierten Samples sollten nahe der neuen Position (x≈1.0) sein
-    assert np.all(np.abs(conv[:, :, 0] - 1.0) < 0.2), (
-        "Konvergierte Samples sollten die neue Position widerspiegeln"
-    )
+    # Alle konvergierten Samples sollten nahe der neuen Position (target) sein
+    for i in range(conv.shape[1]):
+        assert np.all(np.abs(conv[:, i, :] - target[i]) < 0.2), (
+            "Konvergierte Samples sollten die neue Position widerspiegeln"
+        )
 
 
 # ── 6. Max-Steps als Safety-Cap ───────────────────────────────────────────
@@ -267,7 +290,11 @@ def test_max_steps_no_convergence():
 
     def pos_fn(step):
         p = np.zeros((4, 3))
-        p[:, 0] = step * 0.5  # nie konvergiert
+        # Jedes Atom driftet unterschiedlich → interne Struktur ändert sich
+        p[0, 0] = step * 0.5
+        p[1, 0] = step * 0.3
+        p[2, 0] = step * 0.7
+        p[3, 0] = step * 0.4
         return p
 
     stopped, _ = _run_monitor(monitor, 50, temp_fn, pos_fn)
@@ -373,9 +400,12 @@ def test_samples_property_returns_all():
 
     for step in range(1, 30):
         monitor._atoms._temp = 300.0
-        # Driftende Positionen → keine Konvergenz → kein Stop
+        # Driftende Positionen (nicht-uniform) → keine Konvergenz → kein Stop
         p = np.zeros((4, 3))
-        p[:, 0] = step * 0.1
+        p[0, 0] = step * 0.1
+        p[1, 0] = step * 0.2
+        p[2, 0] = step * 0.05
+        p[3, 0] = step * 0.15
         monitor._atoms._positions = p
         try:
             monitor()
@@ -408,11 +438,19 @@ def test_persistence_prevents_transient_stop():
 
     def pos_fn(step):
         p = np.zeros((4, 3))
-        # Konstanter Drift, außer Schritt 8-9: kurz eingefroren
+        # Konstanter nicht-uniformer Drift, außer Schritt 8-9: kurz eingefroren
         if step in (8, 9):
-            p[:, 0] = 0.7  # gleiche Position wie Schritt 7 → RMS ≈ 0
+            # Gleiche interne Struktur wie Schritt 7 → pos_rms ≈ 0
+            p[0, 0] = 0.7 * 0.1
+            p[1, 0] = 0.7 * 0.2
+            p[2, 0] = 0.7 * 0.05
+            p[3, 0] = 0.7 * 0.15
         else:
-            p[:, 0] = 0.1 * step  # linearer Drift
+            # Jedes Atom driftet unterschiedlich
+            p[0, 0] = 0.1 * step
+            p[1, 0] = 0.2 * step
+            p[2, 0] = 0.05 * step
+            p[3, 0] = 0.15 * step
         return p
 
     stopped, _ = _run_monitor(monitor, 50, temp_fn, pos_fn)
@@ -618,3 +656,41 @@ def test_all_three_converged_stops():
     assert stopped_at is not None
     # Vol braucht mindestens eval_window(10) + persistence(3) - 1 = 12 Schritte
     assert stopped_at >= 12, f"Stop zu früh (stopped_at={stopped_at})"
+
+
+# ── 17. COM-Drift wird aus pos_rms entfernt → Stop ────────────────────────
+def test_com_drift_ignored_for_convergence():
+    """Alle Atome verschieben sich gemeinsam (COM-Drift), interne Struktur
+    bleibt konstant → pos_rms sollte ~0 sein → Stop.
+
+    Ohne COM-Entfernung würde der Rolling-Mean den Drift erfassen und
+    pos_rms wäre groß → kein Stop.  Mit COM-Entfernung sollte die
+    Konvergenz erkannt werden.
+    """
+    cfg = _fast_cfg(
+        pos_convergence_min_samples=6,
+        pos_convergence_min_window=3,
+        pos_convergence_persistence=3,
+    )
+    dyn = _FakeDyn()
+    atoms = _FakeAtoms(n_atoms=4)
+    monitor = _CombinedEquilibriumMonitor(dyn, atoms, cfg)
+
+    # Basis-Positionen: 4 Atome in einem Quadrat
+    base = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float)
+
+    def temp_fn(step):
+        return 300.0
+
+    def pos_fn(step):
+        # Alle Atome verschieben sich gemeinsam in x-Richtung (COM-Drift)
+        # nach Schritt 3, aber die interne Struktur bleibt konstant.
+        p = base.copy()
+        if step > 3:
+            p[:, 0] += 0.5 * (step - 3)  # COM-Drift
+        return p
+
+    stopped, _ = _run_monitor(monitor, 100, temp_fn, pos_fn)
+    assert stopped, (
+        "COM-Drift sollte ignoriert werden — interne Struktur ist konstant"
+    )

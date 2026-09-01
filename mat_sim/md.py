@@ -74,6 +74,10 @@ class _CombinedEquilibriumMonitor:
     und erst wenn er dort konvergiert, wird gestoppt.  Die alten Positionen
     werden aus dem Fenster hinausgeschoben und verfälschen nicht das Ergebnis.
 
+    Der Schwerpunkt (COM) wird vor der Rolling-Mean-Berechnung pro Sample
+    entfernt, so dass nur interne Strukturänderungen (keine Translation)
+    zur pos_rms beitragen.
+
     Die Fenstergröße für den Rolling-Mean wird adaptiv aus der
     Schwingungsperiode bestimmt: Autokorrelation der Positionen → Periode →
     Fenster = ``pos_convergence_window_mult`` × Periode.
@@ -425,11 +429,22 @@ class _CombinedEquilibriumMonitor:
     def _compute_pos_rms(self) -> float:
         """RMS-Verschiebung zwischen zwei aufeinanderfolgenden Rolling-Means.
 
+        Der Schwerpunkt (COM) wird **pro Sample** entfernt, bevor die
+        Rolling-Means berechnet werden.  Die COM-Bewegung ist ein
+        Nulleffekt (Translationsmodus), der nicht zur strukturellen
+        Konvergenz beiträgt, aber pos_rms mit langwelligen Oszillationen
+        (Periode ~500–1000 Steps) aufbläht, die die Plateau-Erkennung
+        bei niedrigen Temperaturen verhindern.
+
         Gibt ``nan`` zurück, wenn nicht genügend Samples für zwei Fenster
         vorhanden sind.
         """
         samples = np.array(self._position_samples)
         n = len(samples)
+
+        # COM pro Sample entfernen (Translationsmodus herausfiltern)
+        com = np.mean(samples, axis=1, keepdims=True)  # (n, 1, 3)
+        samples = samples - com
 
         # Schwingungsperiode schätzen (einmalig pro T-Stufe)
         if self._period_samples is None:
