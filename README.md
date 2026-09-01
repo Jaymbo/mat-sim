@@ -132,7 +132,8 @@ uv run python -m mat_sim.run --help
 | MLIP | MACE-MP (Universal-Potenzial, Default) oder CHGNet |
 | MD-Ensemble | NPT mit Nosé-Hoover-Thermostat & -Barostat (1 atm) |
 | Temperaturrampe | 0 K → T_max in Schritten von ΔT, pro Schritt N thermalization steps |
-| Early Stopping | Abbruch bei thermischem Gleichgewicht (rel. Std < 2 % nach 20 Schritten) |
+| Early Stopping | Abbruch wenn **alle drei** Bedingungen erfüllt: Temperatur (rel. Std < 10 % über 100 Steps), Positionen (Plateau-Erkennung, rel. Std < 10 % über 500 Steps), Volumen (rel. Std < 2 % über 500 Steps) |
+| Barostat | τ_P = 100 fs (Periode ~500 Steps, schnelles Abklingen von Volumen-Oszillationen) |
 | Phasenwechsel (T_switch) | Diskontinuierliche RDF-Peak-Verschiebung (> 0.15 Å) |
 | Zerfall (T_decay) | Lindemann-Kriterium: MSD > 12 % × d_NN² |
 | Optik | Drude-Lorentz ε(ω) + IR-Phononen (8–13 µm) + Mie-Streuung (PyMieScatt) |
